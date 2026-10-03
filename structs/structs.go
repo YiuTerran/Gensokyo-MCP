@@ -10,6 +10,7 @@ type Settings struct {
 	//反向ws设置
 	WsAddress           []string `yaml:"ws_address"`
 	WsToken             []string `yaml:"ws_token"`
+	WsBackendID         []string `yaml:"ws_backend_id"`
 	ReconnecTimes       int      `yaml:"reconnect_times"`
 	HeartBeatInterval   int      `yaml:"heart_beat_interval"`
 	LaunchReconectTimes int      `yaml:"launch_reconnect_times"`

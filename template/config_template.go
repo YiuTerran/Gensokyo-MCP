@@ -6,6 +6,7 @@ settings:
   #反向ws设置
   ws_address: ["ws://<YOUR_WS_ADDRESS>:<YOUR_WS_PORT>"] # WebSocket服务的地址 支持多个["","",""]
   ws_token: ["","",""]              #连接wss地址时服务器所需的token,按顺序一一对应,如果是ws地址,没有密钥,请留空.
+  ws_backend_id: ["default"]        # 与 ws_address 按位置对应的唯一名称，多个后端时分别填写如 ["sealdice","nonebot"]
   reconnect_times : 100             #反向ws连接失败后的重试次数,希望一直重试,可设置9999
   heart_beat_interval : 5          #反向ws心跳间隔 单位秒 推荐5-10
   launch_reconnect_times : 1        #启动时尝试反向ws连接次数,建议先打开应用端再开启gensokyo,因为启动时连接会阻塞webui启动,默认只连接一次,可自行增大

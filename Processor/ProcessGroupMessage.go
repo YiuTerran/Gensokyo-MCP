@@ -2,6 +2,7 @@
 package Processor
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -14,8 +15,6 @@ import (
 // ProcessGroupMessage 处理群组消息
 func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocketClient) (err error) {
 
-	selfid := config.GetUinint64()
-
 	var args struct {
 		Payload string `json:"payload"`
 		UserID  string `json:"user_id"`
@@ -26,6 +25,11 @@ func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocke
 	if err := data.BindArguments(&args); err != nil {
 		return err
 	}
+	messageID, allocErr := NextSyntheticMessageID()
+	if allocErr != nil {
+		return fmt.Errorf("allocate OneBot message ID: %w", allocErr)
+	}
+	selfid := config.GetUinint64()
 	if args.Payload == "" {
 		args.Payload = "帮助"
 	}
@@ -49,7 +53,7 @@ func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocke
 		groupMsg := OnebotGroupMessage{
 			RawMessage:  messageText,
 			Message:     segmentedMessages,
-			MessageID:   123,
+			MessageID:   int(messageID),
 			GroupID:     int64(intGroup),
 			MessageType: "group",
 			PostType:    "message",
@@ -75,9 +79,6 @@ func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocke
 			// }
 		}
 
-		// 调试
-		PrintStructWithFieldNames(groupMsg)
-
 		// Convert OnebotGroupMessage to map and send
 		groupMsgMap := structToMap(groupMsg)
 		//上报信息到onebotv11应用端(正反ws)
@@ -87,7 +88,7 @@ func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocke
 		groupMsg := OnebotGroupMessageS{
 			RawMessage:  messageText,
 			Message:     segmentedMessages,
-			MessageID:   "",
+			MessageID:   strconv.FormatInt(int64(messageID), 10),
 			GroupID:     args.GroupID,
 			MessageType: "group",
 			PostType:    "message",
@@ -115,9 +116,6 @@ func ProcessGroupMessage(data mcp.CallToolRequest, Wsclient []*wsclient.WebSocke
 			// 	//groupMsg.Avatar, _ = GenerateAvatarURL(userid64)
 			// }
 		}
-
-		// 调试
-		PrintStructWithFieldNames(groupMsg)
 
 		// Convert OnebotGroupMessage to map and send
 		groupMsgMap := structToMap(groupMsg)

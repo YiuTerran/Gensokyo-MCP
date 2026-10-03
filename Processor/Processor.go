@@ -15,6 +15,10 @@ import (
 	"github.com/hoshinonyaruko/gensokyo-mcp/wsclient"
 )
 
+func NextSyntheticMessageID() (int32, error) {
+	return wsclient.AllocateProtocolMessageID()
+}
+
 // Processor 结构体用于处理消息
 type Processors struct {
 	Settings        *structs.Settings                 // 使用指针
@@ -252,7 +256,7 @@ func (p *Processors) BroadcastMessageToAll(message map[string]interface{}, data 
 	}
 
 	if len(errors) > 0 {
-		return fmt.Errorf(strings.Join(errors, "; "))
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
 
 	return nil
@@ -265,7 +269,7 @@ func BroadcastMessageToAll(message map[string]interface{}, Wsclient []*wsclient.
 	// 发送到我们作为客户端的Wsclient
 	for _, client := range Wsclient {
 		//mylog.Printf("第%v个Wsclient", test)
-		err := client.SendMessage(message)
+		err := client.SendOneShotMessage(message)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("error sending private message via wsclient: %v", err))
 		}
@@ -273,7 +277,7 @@ func BroadcastMessageToAll(message map[string]interface{}, Wsclient []*wsclient.
 
 	// 在循环结束后处理记录的错误
 	if len(errors) > 0 {
-		return fmt.Errorf(strings.Join(errors, "; "))
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
 	}
 
 	return nil

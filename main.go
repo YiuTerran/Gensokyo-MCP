@@ -11,15 +11,21 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hoshinonyaruko/gensokyo-mcp/Processor"
 	"github.com/hoshinonyaruko/gensokyo-mcp/botstats"
+	"github.com/hoshinonyaruko/gensokyo-mcp/bridge"
 	"github.com/hoshinonyaruko/gensokyo-mcp/callapi"
 	"github.com/hoshinonyaruko/gensokyo-mcp/config"
 	"github.com/hoshinonyaruko/gensokyo-mcp/praser"
@@ -33,22 +39,150 @@ import (
 
 // 消息处理器，持有 openapi 对象
 var wsClients []*wsclient.WebSocketClient
+var wsBackendClients = map[string]*wsclient.WebSocketClient{}
+var wsClientsMu sync.RWMutex
+var wsBridge *bridge.Manager
+var bridgeEnabled bool
+var bridgeMCPToken string
+var bridgeInternalToken string
 
 // ---------- Context helpers ----------
 
 type bearerKey struct{}
+type rpcIDContextKey struct{}
+
+var rpcCancelMu sync.Mutex
+
+type rpcCancelEntry struct{ cancel context.CancelFunc }
+
+var rpcCancelBySession = map[string]*rpcCancelEntry{}
 
 func withBearer(ctx context.Context, b string) context.Context {
 	return context.WithValue(ctx, bearerKey{}, b)
 }
 
-func bearerFromRequest(_ context.Context, r *http.Request) context.Context {
-	fmt.Printf("headers: %+v\n", r.Header) // 打印所有header
-	return withBearer(r.Context(), r.Header.Get("Authorization"))
+func bearerFromRequest(ctx context.Context, r *http.Request) context.Context {
+	return withBearer(ctx, r.Header.Get("Authorization"))
 }
 
 func bearerFromEnv(ctx context.Context) context.Context {
 	return withBearer(ctx, os.Getenv("BEARER"))
+}
+
+func requestIDContext(ctx context.Context) string {
+	value, _ := ctx.Value(rpcIDContextKey{}).(string)
+	return value
+}
+
+func withRPCRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const maxMCPBody = 1024 * 1024
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxMCPBody+1))
+		_ = r.Body.Close()
+		if err != nil || len(body) > maxMCPBody {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+		var envelope struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(body, &envelope) == nil && len(envelope.ID) != 0 && string(envelope.ID) != "null" {
+			ctx := context.WithValue(r.Context(), rpcIDContextKey{}, strings.TrimSpace(string(envelope.ID)))
+			r = r.WithContext(ctx)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func registerRPCCancel(ctx context.Context, cancel context.CancelFunc) (func(), bool) {
+	rpcID := requestIDContext(ctx)
+	session := server.ClientSessionFromContext(ctx)
+	if rpcID == "" || session == nil || session.SessionID() == "" {
+		return func() {}, true
+	}
+	key := session.SessionID() + "\x00" + rpcID
+	entry := &rpcCancelEntry{cancel: cancel}
+	rpcCancelMu.Lock()
+	if rpcCancelBySession[key] != nil {
+		rpcCancelMu.Unlock()
+		return func() {}, false
+	}
+	rpcCancelBySession[key] = entry
+	rpcCancelMu.Unlock()
+	return func() {
+		rpcCancelMu.Lock()
+		if rpcCancelBySession[key] == entry {
+			delete(rpcCancelBySession, key)
+		}
+		rpcCancelMu.Unlock()
+	}, true
+}
+
+const (
+	defaultBridgeSelfID int64 = 10000
+	maxSafeOneBotID     int64 = 1<<53 - 1
+)
+
+func applyOneBotEnvironment(conf *config.Config) error {
+	wsURL := os.Getenv("ONEBOT_WS_URL")
+	backendID := os.Getenv("ONEBOT_BACKEND_ID")
+	token := os.Getenv("ONEBOT_WS_TOKEN")
+	if bridgeEnabled {
+		if conf.Settings.Uin < 0 || conf.Settings.Uin > maxSafeOneBotID {
+			return errors.New("configured OneBot self ID must be a positive safe integer")
+		}
+		if rawSelfID := os.Getenv("ONEBOT_SELF_ID"); rawSelfID != "" {
+			selfID, err := parsePositiveSafeOneBotID(rawSelfID)
+			if err != nil {
+				return err
+			}
+			conf.Settings.Uin = selfID
+		} else if conf.Settings.Uin == 0 {
+			conf.Settings.Uin = defaultBridgeSelfID
+		}
+		if conf.Settings.Uin <= 0 {
+			return errors.New("bridge mode requires a positive OneBot self ID")
+		}
+	}
+	if bridgeEnabled && wsURL == "" && (len(conf.Settings.WsAddress) == 0 || strings.Contains(strings.Join(conf.Settings.WsAddress, ""), "<YOUR_WS_ADDRESS>")) {
+		wsURL = "ws://sealdice:18081/ws"
+	}
+	if wsURL != "" {
+		if backendID == "" {
+			backendID = "sealdice"
+		}
+		conf.Settings.WsAddress = []string{wsURL}
+		conf.Settings.WsBackendID = []string{backendID}
+		// An override URL never inherits an unrelated token from config.yml.
+		conf.Settings.WsToken = []string{token}
+	} else if backendID != "" && len(conf.Settings.WsAddress) == 1 {
+		conf.Settings.WsBackendID = []string{backendID}
+	}
+	if token != "" && wsURL == "" && len(conf.Settings.WsAddress) == 1 {
+		conf.Settings.WsToken = []string{token}
+	}
+	return nil
+}
+
+func parsePositiveSafeOneBotID(raw string) (int64, error) {
+	if raw == "" {
+		return 0, errors.New("OneBot self ID is empty")
+	}
+	for _, char := range raw {
+		if char < '0' || char > '9' {
+			return 0, errors.New("OneBot self ID must be a positive safe integer")
+		}
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 || value > maxSafeOneBotID || strconv.FormatInt(value, 10) != raw {
+		return 0, errors.New("OneBot self ID must be a positive safe integer")
+	}
+	return value, nil
 }
 
 // ---------- WebSocket tool handler ----------
@@ -60,37 +194,92 @@ type GensokyoServer struct {
 }
 
 func NewGensokyoServer() *GensokyoServer {
+	wsclient.SetBridgeManager(wsBridge)
+	hooks := &server.Hooks{}
+	hooks.AddAfterListTools(func(_ context.Context, _ any, _ *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
+		if !bridgeEnabled || bridgeReadyBackendAvailable() {
+			return
+		}
+		filtered := result.Tools[:0]
+		for _, tool := range result.Tools {
+			if tool.Name != "call_ws" {
+				filtered = append(filtered, tool)
+			}
+		}
+		result.Tools = filtered
+	})
 	s := server.NewMCPServer(
 		"gensokyo-mcp",
 		"0.1.0",
 		server.WithResourceCapabilities(true, true),
 		server.WithToolCapabilities(true),
+		server.WithHooks(hooks),
 	)
+	s.AddNotificationHandler("notifications/cancelled", func(ctx context.Context, notification mcp.JSONRPCNotification) {
+		session := server.ClientSessionFromContext(ctx)
+		if session == nil || session.SessionID() == "" {
+			return
+		}
+		value, ok := notification.Params.AdditionalFields["requestId"]
+		if !ok {
+			return
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return
+		}
+		key := session.SessionID() + "\x00" + string(encoded)
+		rpcCancelMu.Lock()
+		entry := rpcCancelBySession[key]
+		rpcCancelMu.Unlock()
+		if entry != nil {
+			entry.cancel()
+		}
+	})
 
-	wsTool := mcp.NewTool("call_ws",
-		mcp.WithDescription("连接目标 Onebot Ws 调用bot并取得回复."),
-		mcp.WithString("payload",
-			mcp.Description("可选：发送到服务器的文本负载"),
-			mcp.DefaultString("帮助"),
-		),
-		mcp.WithString("user_id",
-			mcp.Description("可选：测试使用的user_id"),
-			mcp.DefaultString("0"),
-		),
-		mcp.WithString("group_id",
-			mcp.Description("可选：测试使用的group_id"),
-			mcp.DefaultString("0"),
-		),
-		mcp.WithNumber("timeout",
-			mcp.Description("连接与首条消息读取超时，单位秒，默认 10"),
-			mcp.DefaultNumber(10),
-			mcp.Min(1),
-		),
-	)
+	var wsTool mcp.Tool
+	if bridgeEnabled {
+		wsTool = mcp.NewTool("call_ws",
+			mcp.WithDescription("Send one text command to a registered OneBot backend and collect only correlated replies before explicit completion."),
+			mcp.WithString("payload", mcp.Description("One-line text command, up to 4000 characters")),
+			mcp.WithString("backend_id", mcp.Description("Configured backend alias")),
+			mcp.WithString("request_id", mcp.Description("Trusted idempotency key")),
+			mcp.WithString("audience", mcp.Description("group or private")),
+			mcp.WithString("user_key", mcp.Description("Trusted opaque user identity")),
+			mcp.WithString("group_key", mcp.Description("Trusted opaque group identity")),
+			mcp.WithNumber("user_id", mcp.Description("Compatibility numeric OneBot user ID")),
+			mcp.WithNumber("group_id", mcp.Description("Compatibility numeric OneBot group ID")),
+		)
+	} else {
+		// Keep the original tool schema when the optional bridge is disabled.
+		wsTool = mcp.NewTool("call_ws",
+			mcp.WithDescription("连接目标 Onebot Ws 调用bot并取得回复."),
+			mcp.WithString("payload", mcp.Description("可选：发送到服务器的文本负载"), mcp.DefaultString("帮助")),
+			mcp.WithString("user_id", mcp.Description("可选：测试使用的user_id"), mcp.DefaultString("0")),
+			mcp.WithString("group_id", mcp.Description("可选：测试使用的group_id"), mcp.DefaultString("0")),
+			mcp.WithNumber("timeout", mcp.Description("连接与首条消息读取超时，单位秒，默认 10"), mcp.DefaultNumber(10), mcp.Min(1)),
+		)
+	}
 
 	// 可以add 多个tool
 	s.AddTool(wsTool, callWS)
-	return &GensokyoServer{srv: s}
+	result := &GensokyoServer{srv: s}
+	if wsBridge != nil {
+		wsBridge.SetReadinessCallback(func() { s.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil) })
+	}
+	return result
+}
+
+func bridgeReadyBackendAvailable() bool {
+	if wsBridge == nil {
+		return false
+	}
+	for _, backend := range wsBridge.Backends() {
+		if backend.Ready && backend.Version == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *GensokyoServer) HTTPServer() *server.StreamableHTTPServer {
@@ -113,8 +302,9 @@ func main() {
 	transport := flag.String("t", "http", "Transport: http | stdio")
 	addr := flag.String("addr", ":8090", "HTTP listen address")
 	flag.Parse()
-
-	s := NewGensokyoServer()
+	bridgeEnabled = strings.EqualFold(os.Getenv("LLM_BRIDGE_ENABLED"), "true") || os.Getenv("LLM_BRIDGE_ENABLED") == "1"
+	bridgeMCPToken = os.Getenv("LLM_BRIDGE_MCP_TOKEN")
+	bridgeInternalToken = os.Getenv("LLM_BRIDGE_INTERNAL_TOKEN")
 
 	if _, err := os.Stat("config.yml"); os.IsNotExist(err) {
 		var err error
@@ -129,10 +319,12 @@ func main() {
 			return
 		}
 
-		log.Println("请配置config.yml然后再次运行.")
-		log.Print("按下 Enter 继续...")
-		bufio.NewReader(os.Stdin).ReadBytes('\n')
-		os.Exit(0)
+		if !bridgeEnabled {
+			log.Println("请配置config.yml然后再次运行.")
+			log.Print("按下 Enter 继续...")
+			bufio.NewReader(os.Stdin).ReadBytes('\n')
+			os.Exit(0)
+		}
 	}
 
 	// 主逻辑
@@ -141,6 +333,47 @@ func main() {
 	if err != nil {
 		log.Fatalf("error: %v", err)
 	}
+	if err := applyOneBotEnvironment(conf); err != nil {
+		log.Fatal("invalid OneBot bridge account identity")
+	}
+	if bridgeEnabled {
+		if len(conf.Settings.WsBackendID) != len(conf.Settings.WsAddress) {
+			log.Fatal("bridge mode requires one explicit backend ID for each OneBot URL")
+		}
+		for i, address := range conf.Settings.WsAddress {
+			if address != "" && conf.Settings.WsBackendID[i] == "" {
+				log.Fatal("bridge mode requires one explicit backend ID for each OneBot URL")
+			}
+		}
+	}
+	backendIDs, err := resolveBackendIDs(conf.Settings.WsAddress, conf.Settings.WsBackendID)
+	if err != nil {
+		log.Fatalf("invalid WebSocket backend configuration")
+	}
+	if bridgeEnabled {
+		if bridgeMCPToken == "" || bridgeInternalToken == "" {
+			log.Fatal("bridge MCP and internal tokens are required")
+		}
+		dataDir := os.Getenv("LLM_BRIDGE_DATA_DIR")
+		if dataDir == "" {
+			log.Fatal("LLM_BRIDGE_DATA_DIR is required when bridge is enabled")
+		}
+		if err := os.MkdirAll(dataDir, 0700); err != nil {
+			log.Fatal("bridge data directory is unavailable")
+		}
+		wsBridge, err = bridge.Open(filepath.Join(dataDir, "bridge.db"))
+		if err != nil {
+			log.Fatal("bridge state store could not be opened")
+		}
+		defer wsBridge.Close()
+		wsBridge.ConfigureBackends(backendIDs)
+	} else if err := wsclient.OpenMessageIDAllocator(filepath.Join(".", "message_ids.db")); err != nil {
+		log.Fatal("OneBot message ID allocator could not be opened")
+	} else {
+		defer wsclient.CloseMessageIDAllocator()
+	}
+	wsclient.SetBridgeManager(wsBridge)
+	s := NewGensokyoServer()
 
 	// 配置热重载
 	go setupConfigWatcher("config.yml")
@@ -152,34 +385,43 @@ func main() {
 
 	// 启动多个WebSocket客户端的逻辑
 	if !allEmpty(conf.Settings.WsAddress) {
-		wsClientChan := make(chan *wsclient.WebSocketClient, len(conf.Settings.WsAddress))
+		type wsClientResult struct {
+			backendID string
+			client    *wsclient.WebSocketClient
+		}
+		wsClientChan := make(chan wsClientResult, len(conf.Settings.WsAddress))
 		errorChan := make(chan error, len(conf.Settings.WsAddress))
 		// 定义计数器跟踪尝试建立的连接数
 		attemptedConnections := 0
-		for _, wsAddr := range conf.Settings.WsAddress {
+		for i, wsAddr := range conf.Settings.WsAddress {
 			if wsAddr == "" {
 				continue // Skip empty addresses
 			}
 			attemptedConnections++ // 增加尝试连接的计数
-			go func(address string) {
+			backendID := backendIDs[i]
+			go func(address, id string) {
 				retry := config.GetLaunchReconectTimes()
 				BotID := uint64(config.GetUinint64())
-				wsClient, err := wsclient.NewWebSocketClient(address, BotID, retry)
+				wsClient, err := wsclient.NewWebSocketClient(address, BotID, retry, id)
 				if err != nil {
-					log.Printf("Error creating WebSocketClient for address(连接到反向ws失败) %s: %v\n", address, err)
+					log.Printf("WebSocket connection failed for backend %s", id)
 					errorChan <- err
 					return
 				}
-				wsClientChan <- wsClient
-			}(wsAddr)
+				wsClientChan <- wsClientResult{backendID: id, client: wsClient}
+			}(wsAddr, backendID)
 		}
 		// 获取连接成功后的wsClient
 		for i := 0; i < attemptedConnections; i++ {
 			select {
-			case wsClient := <-wsClientChan:
-				wsClients = append(wsClients, wsClient)
+			case result := <-wsClientChan:
+				wsClientsMu.Lock()
+				wsClients = append(wsClients, result.client)
+				wsBackendClients[result.backendID] = result.client
+				wsClientsMu.Unlock()
 			case err := <-errorChan:
-				log.Printf("Error encountered while initializing WebSocketClient: %v\n", err)
+				_ = err
+				log.Print("OneBot backend failed to connect during startup")
 			}
 		}
 
@@ -213,6 +455,16 @@ func main() {
 			}
 		}
 	}
+	defer func() {
+		wsClientsMu.RLock()
+		clients := append([]*wsclient.WebSocketClient(nil), wsClients...)
+		wsClientsMu.RUnlock()
+		for _, client := range clients {
+			if client != nil {
+				_ = client.Close()
+			}
+		}
+	}()
 
 	switch *transport {
 	case "stdio":
@@ -229,30 +481,14 @@ func main() {
 
 // ---------- 启动 HTTP 服务器：/mcp → Streamable HTTP  /sse → 旧式 SSE ----------
 func serveHTTP(ctx context.Context, core *server.MCPServer, addr string) error {
-	streamSrv := server.NewStreamableHTTPServer(
-		core,
-		server.WithHTTPContextFunc(bearerFromRequest), // 注入 bearer
-	)
-
-	sseSrv := server.NewSSEServer(
-		core,
-		server.WithStaticBasePath("/sse"), // 旧客户端连 GET /sse 拿 schema
-		server.WithBaseURL("http://127.0.0.1"+addr),  // 生成绝对路径
-		server.WithSSEContextFunc(bearerFromRequest), // 同样注入 bearer
-	)
-
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", streamSrv) // 单端点即可完成初始化 + 调用 + 流
-	mux.Handle("/sse/", sseSrv)   // /sse (GET) 取 schema, /sse/message (POST) 发消息
-	mux.Handle("/sse", http.RedirectHandler("/sse/", http.StatusMovedPermanently))
-
-	httpSrv := &http.Server{Addr: addr, Handler: mux}
+	httpSrv := &http.Server{Addr: addr, Handler: buildHTTPHandler(core, addr)}
 
 	// 异步启动
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("🚀 Streamable HTTP → http://127.0.0.1%[1]s/mcp\n", addr)
-		log.Printf("🚀 SSE            → http://127.0.0.1%[1]s/sse\n", addr)
+		baseURL := httpBaseURL(addr)
+		log.Printf("🚀 Streamable HTTP → %s/mcp\n", baseURL)
+		log.Printf("🚀 SSE            → %s/sse\n", baseURL)
 		errCh <- httpSrv.ListenAndServe()
 	}()
 
@@ -270,6 +506,56 @@ func serveHTTP(ctx context.Context, core *server.MCPServer, addr string) error {
 		}
 	}
 	return nil
+}
+
+func buildHTTPHandler(core *server.MCPServer, address ...string) http.Handler {
+	baseURL := "http://127.0.0.1"
+	if len(address) > 0 && address[0] != "" {
+		baseURL = httpBaseURL(address[0])
+	}
+	streamSrv := server.NewStreamableHTTPServer(
+		core,
+		server.WithHTTPContextFunc(bearerFromRequest), // 注入 bearer
+	)
+
+	sseSrv := server.NewSSEServer(
+		core,
+		server.WithStaticBasePath("/sse"), // 旧客户端连 GET /sse 拿 schema
+		server.WithBaseURL(baseURL),       // 生成绝对路径
+		server.WithSSEContextFunc(bearerFromRequest), // 同样注入 bearer
+	)
+
+	mux := http.NewServeMux()
+	mcpRoutes := withRPCRequestID(streamSrv)
+	sseRoutes := withRPCRequestID(sseSrv)
+	if bridgeEnabled {
+		mcpRoutes = bridge.MCPAuth(bridgeMCPToken, mcpRoutes)
+		sseRoutes = bridge.MCPAuth(bridgeMCPToken, sseRoutes)
+	}
+	mux.Handle("/mcp", mcpRoutes)
+	mux.Handle("/sse/", sseRoutes)
+	redirect := http.Handler(http.RedirectHandler("/sse/", http.StatusMovedPermanently))
+	if bridgeEnabled {
+		redirect = bridge.MCPAuth(bridgeMCPToken, redirect)
+	}
+	mux.Handle("/sse", redirect)
+	mux.Handle("/healthz", bridge.HealthHandler())
+	if bridgeEnabled {
+		mux.Handle("/internal/", bridge.InternalHandler(wsBridge, bridgeInternalToken))
+	}
+
+	return mux
+}
+
+func httpBaseURL(address string) string {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "http://127.0.0.1"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 func setupConfigWatcher(configFilePath string) {
@@ -320,11 +606,158 @@ func allEmpty(addresses []string) bool {
 	return true
 }
 
-// callWS 连接指定 WebSocket，写入 payload（若有），
-// 读取首条文本消息并作为工具结果返回。
-// 若首条消息内容为 "帮助"，则通过 ProcessGroupMessage 转发到群聊。
+func resolveBackendIDs(addresses, configured []string) ([]string, error) {
+	active := 0
+	for _, address := range addresses {
+		if address != "" {
+			active++
+		}
+	}
+	if active == 0 {
+		return nil, nil
+	}
+	ids := append([]string(nil), configured...)
+	if len(ids) == 1 && ids[0] == "default" && active > 1 {
+		ids = make([]string, len(addresses))
+		for i := range ids {
+			ids[i] = fmt.Sprintf("backend-%d", i+1)
+		}
+	}
+	if len(ids) == 0 {
+		if active == 1 {
+			ids = make([]string, len(addresses))
+			for i, address := range addresses {
+				if address != "" {
+					ids[i] = "default"
+				}
+			}
+		} else {
+			return nil, fmt.Errorf("configure one ws_backend_id for each ws_address")
+		}
+	}
+	if len(ids) != len(addresses) {
+		return nil, fmt.Errorf("got %d ws_backend_id values for %d ws_address values", len(ids), len(addresses))
+	}
+	seen := map[string]bool{}
+	for i, address := range addresses {
+		if address == "" {
+			continue
+		}
+		if ids[i] == "" {
+			return nil, fmt.Errorf("ws_backend_id[%d] is empty", i)
+		}
+		if seen[ids[i]] {
+			return nil, fmt.Errorf("duplicate backend id %q", ids[i])
+		}
+		seen[ids[i]] = true
+	}
+	return ids, nil
+}
+
 func callWS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// ---------- 1. 解析参数 ----------
+	if !bridgeEnabled || wsBridge == nil {
+		return callWSLegacy(ctx, req)
+	}
+	var args struct {
+		Payload   string          `json:"payload"`
+		UserID    json.RawMessage `json:"user_id"`
+		GroupID   json.RawMessage `json:"group_id"`
+		UserKey   string          `json:"user_key"`
+		GroupKey  string          `json:"group_key"`
+		BackendID string          `json:"backend_id"`
+		RequestID string          `json:"request_id"`
+		Audience  string          `json:"audience"`
+	}
+	if err := req.BindArguments(&args); err != nil {
+		return mcp.NewToolResultError("invalid call_ws arguments"), nil
+	}
+	if args.Audience == "" {
+		args.Audience = "group"
+	}
+	if args.BackendID == "" || args.RequestID == "" || args.Payload == "" {
+		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
+	}
+	if (args.UserKey != "" && len(args.UserID) != 0) || (args.GroupKey != "" && len(args.GroupID) != 0) {
+		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
+	}
+	var userID, groupID int64
+	var err error
+	if args.UserKey != "" {
+		userID, err = wsBridge.MapIdentity(args.BackendID, "user", args.UserKey)
+	} else {
+		userID, err = parseCompatOneBotID(args.UserID)
+	}
+	if err != nil {
+		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
+	}
+	if args.Audience == "group" {
+		if args.GroupKey != "" {
+			groupID, err = wsBridge.MapIdentity(args.BackendID, "group", args.GroupKey)
+		} else {
+			groupID, err = parseCompatOneBotID(args.GroupID)
+		}
+	} else if len(args.GroupID) != 0 || args.GroupKey != "" {
+		err = bridge.ErrInvalidRequest
+	}
+	if err != nil {
+		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
+	}
+	bridgeRequest := bridge.Request{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Payload: args.Payload, UserKey: args.UserKey, GroupKey: args.GroupKey, UserID: userID, GroupID: groupID}
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	unregister, registered := registerRPCCancel(callCtx, cancel)
+	if !registered {
+		return mcp.NewToolResultError("duplicate active MCP request id"), nil
+	}
+	defer unregister()
+	result, err := wsBridge.Call(callCtx, bridgeRequest, func(dispatchCtx context.Context, connectionID, socketID string, sourceID int32) error {
+		wsClientsMu.RLock()
+		client := wsBackendClients[args.BackendID]
+		wsClientsMu.RUnlock()
+		if client == nil {
+			return bridge.ErrBackendUnavailable
+		}
+		event, buildErr := Processor.BuildBridgeEvent(args.Payload, args.Audience, userID, groupID, sourceID)
+		if buildErr != nil {
+			return bridge.ErrInvalidRequest
+		}
+		_ = connectionID // the event is emitted only through the captured socket ID.
+		return client.SendBridgeMessage(dispatchCtx, socketID, event)
+	})
+	if result.Outputs == nil {
+		status := "failed"
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			status = "unknown"
+		}
+		result = bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: status, Outputs: []bridge.Output{}}
+	}
+	if errors.Is(err, bridge.ErrRequestConflict) {
+		return mcp.NewToolResultError("request_id conflicts with a prior request"), nil
+	}
+	return bridgeToolResult(result, err), nil
+}
+
+func bridgeToolResult(result bridge.Result, _ error) *mcp.CallToolResult {
+	if result.Outputs == nil {
+		result.Outputs = []bridge.Output{}
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultText(`{"status":"unknown","outputs":[]}`)
+	}
+	return mcp.NewToolResultText(string(data))
+}
+
+func parseCompatOneBotID(raw json.RawMessage) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, bridge.ErrInvalidRequest
+	}
+	return bridge.DecodeJSONNumber(raw)
+}
+
+// The bridge remains optional. Keep the original request and reply behavior
+// byte-for-byte in this branch for existing non-bridge deployments.
+func callWSLegacy(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var args struct {
 		Payload string `json:"payload"`
 		UserID  string `json:"user_id"`
@@ -334,100 +767,52 @@ func callWS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, 
 	if err := req.BindArguments(&args); err != nil {
 		return mcp.NewToolResultErrorFromErr("参数解析失败", err), err
 	}
-
 	if args.Payload == "" {
 		args.Payload = "帮助"
 	}
-
-	fmt.Printf("receive:%s \n", args.Payload)
-
-	PrintCallToolRequestAsJSON(req)
-
-	// ---------- 3. 业务逻辑 ----------
-	// 异步发送群聊消息；bearer 已确保有值
-	go Processor.ProcessGroupMessage(req, wsClients)
-
-	var message *callapi.ActionMessage
-	var err error
-	var resp string
-	// 首先获取超时时间和长查询命令列表
+	if err := Processor.ProcessGroupMessage(req, wsClients); err != nil {
+		return mcp.NewToolResultErrorFromErr("消息派发失败", err), nil
+	}
 	timeout := config.GetTimeOut()
-
-	// 发送消息给WS接口，并等待响应
-	message, err = wsclient.WaitForActionMessage(args.UserID, time.Duration(timeout)*time.Second) // 使用新的超时时间
+	message, err := wsclient.WaitForActionMessage(args.UserID, time.Duration(timeout)*time.Second)
 	if err != nil {
-		log.Printf("Error waiting for action message: %v", err)
-		resp = "等待超时"
-		return mcp.NewToolResultText(resp), nil
+		return mcp.NewToolResultText("等待超时"), nil
 	}
-
-	var strmessage string
-	// 尝试将message.Params.Message断言为string类型
-	if msgStr, ok := message.Params.Message.(string); ok {
-		strmessage = msgStr
+	var text string
+	if messageText, ok := message.Params.Message.(string); ok {
+		text = messageText
 	} else {
-		// 如果不是string，调用parseMessage函数处理
-		strmessage = praser.ParseMessageContent(message.Params.Message, false)
+		text = praser.ParseMessageContent(message.Params.Message, false)
 	}
-
-	// 调用信息处理函数
-	messageType, resultText, resultImg, err := ProcessMessage(strmessage, message)
+	messageType, resultText, resultImg, err := ProcessMessage(text, message)
 	if err != nil {
-		// 处理错误情况
-		resp = "处理错误"
-		return mcp.NewToolResultText(resp), nil
+		return mcp.NewToolResultText("处理错误"), nil
 	}
-
-	// 根据信息处理函数的返回类型决定如何回复
 	switch messageType {
-	case 1: // 纯文本信息
-		var pendingMsgsToReturn []callapi.ActionMessage
-		if resultStr, ok := resultText.(string); ok {
-			// 获取并叠加历史信息，传入当前字数（这里假设当前字数为0）
-			pendingMsgsToReturn, _, err = wsclient.GetPendingMessages(args.UserID, true, len(resultStr))
-			if err != nil {
-				log.Printf("Error getting pending messages: %v", err)
-				// 如果无法获取历史消息，就直接处理当前的消息
-				pendingMsgsToReturn = nil
+	case 1:
+		if result, ok := resultText.(string); ok {
+			pending, _, pendingErr := wsclient.GetPendingMessages(args.UserID, true, len(result))
+			if pendingErr == nil {
+				for _, prior := range pending {
+					var content string
+					if raw, ok := prior.Params.Message.(string); ok {
+						content = raw
+					} else {
+						content = praser.ParseMessageContent(prior.Params.Message, true)
+					}
+					result = fmt.Sprintf("%s\n-----历史信息----\n%s", content, result)
+				}
 			}
+			return mcp.NewToolResultText(result), nil
 		}
-
-		// 遍历所有历史消息，并叠加到 result 前
-		for _, message := range pendingMsgsToReturn {
-			var historyContent string
-			// 处理历史消息内容
-			if msgStr, ok := message.Params.Message.(string); ok {
-				historyContent = msgStr
-			} else {
-				// 如果不是string类型，调用parseMessage函数处理
-				historyContent = praser.ParseMessageContent(message.Params.Message, true)
-			}
-
-			// 将历史信息叠加到当前的 result 前
-			resultText = fmt.Sprintf("%s\n-----历史信息----\n%s", historyContent, resultText)
+	case 2, 4:
+		imageData, imageErr := ImageURLToBase64(resultImg.(string))
+		if imageErr != nil {
+			return nil, imageErr
 		}
-		return mcp.NewToolResultText(resultText.(string)), nil
-	case 2: // 纯图片信息
-		imgBase64, err := ImageURLToBase64(resultImg.(string))
-		if err != nil {
-			return nil, err
-		}
-		return mcp.NewToolResultImage(resultText.(string), imgBase64, "image/jpeg"), nil
-
-	case 4: // 图文信息
-		imgBase64, err := ImageURLToBase64(resultImg.(string))
-		if err != nil {
-			return nil, err
-		}
-		return mcp.NewToolResultImage(resultText.(string), imgBase64, "image/jpeg"), nil
-	// 	case 2: // 纯图片信息
-	// 	return NewToolResultTwoTexts(resultText.(string), resultImg.(string)), nil
-	// case 4: // 图文信息
-	// 	return NewToolResultTwoTexts(resultText.(string), resultImg.(string)), nil
-	default:
-		return mcp.NewToolResultText("未知类型信息"), nil
+		return mcp.NewToolResultImage(resultText.(string), imageData, "image/jpeg"), nil
 	}
-	//return mcp.NewToolResultText("无返回值"), nil
+	return mcp.NewToolResultText("未知类型信息"), nil
 }
 
 // ProcessMessage 处理信息并归类
