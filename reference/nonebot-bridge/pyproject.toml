@@ -1,0 +1,15 @@
+[project]
+name = "qqbot-nonebot-onebot-poc"
+version = "0.1.0"
+description = "Real NoneBot2 OneBot v11 backend for Gensokyo bridge acceptance"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "nonebot2[fastapi]==2.5.0",
+  "nonebot-adapter-onebot==2.4.6",
+  "fastapi==0.142.2",
+  "uvicorn==0.53.0",
+  "websockets==17.1",
+]
+
+[tool.uv]
+package = false

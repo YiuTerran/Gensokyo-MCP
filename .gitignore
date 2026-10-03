@@ -21,3 +21,6 @@ webui/dist/
 
 #ignore data
 data/
+reference/nonebot-bridge/.venv/
+reference/nonebot-bridge/__pycache__/
+reference/nonebot-bridge/.pytest_cache/
