@@ -77,9 +77,19 @@ class MCPClient:
             },
         )
         self.rpc("notifications/initialized", notification=True)
-        assert any(tool["name"] == "call_ws" for tool in self.rpc("tools/list")["tools"])
+        tools = self.rpc("tools/list")["tools"]
+        call_ws = next(tool for tool in tools if tool["name"] == "call_ws")
+        for name in ("user_id", "group_id"):
+            alternatives = call_ws["inputSchema"]["properties"][name]["oneOf"]
+            assert {item["type"] for item in alternatives} == {"integer", "string"}, alternatives
 
-    def command(self, payload: str, expected_status: str = "ok"):
+    def command(
+        self,
+        payload: str,
+        expected_status: str = "ok",
+        user_id: int | str = 11001,
+        group_id: int | str = 22001,
+    ):
         request_id = str(uuid.uuid4())
         result = self.rpc(
             "tools/call",
@@ -90,8 +100,8 @@ class MCPClient:
                     "request_id": request_id,
                     "audience": "group",
                     "payload": payload,
-                    "user_id": 11001,
-                    "group_id": 22001,
+                    "user_id": user_id,
+                    "group_id": group_id,
                 },
             },
         )
@@ -197,6 +207,10 @@ def main():
             assert messages == ["first output", "second delayed output"], split
             next_result = client.command(".echo next request")
             assert [item["message"] for item in next_result["outputs"]] == ["next request"], next_result
+            string_ids = client.command(".echo string identifiers", user_id="11001", group_id="22001")
+            assert [item["message"] for item in string_ids["outputs"]] == ["string identifiers"], string_ids
+            invalid_string_id = client.command(".should not dispatch", "failed", user_id="011001")
+            assert invalid_string_id["outputs"] == [], invalid_string_id
 
             identity = client.command(".identity")
             status_request = urllib.request.Request("http://127.0.0.1:18082/test/status")

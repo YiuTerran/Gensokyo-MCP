@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -247,9 +248,11 @@ func NewGensokyoServer() *GensokyoServer {
 			mcp.WithString("audience", mcp.Description("group or private")),
 			mcp.WithString("user_key", mcp.Description("Trusted opaque user identity")),
 			mcp.WithString("group_key", mcp.Description("Trusted opaque group identity")),
-			mcp.WithNumber("user_id", mcp.Description("Compatibility numeric OneBot user ID")),
-			mcp.WithNumber("group_id", mcp.Description("Compatibility numeric OneBot group ID")),
+			mcp.WithNumber("user_id", mcp.Description("Compatibility OneBot user ID: a safe positive integer or canonical decimal string")),
+			mcp.WithNumber("group_id", mcp.Description("Compatibility OneBot group ID: a safe positive integer or canonical decimal string")),
 		)
+		wsTool.InputSchema.Properties["user_id"] = compatOneBotIDSchema("Compatibility OneBot user ID")
+		wsTool.InputSchema.Properties["group_id"] = compatOneBotIDSchema("Compatibility OneBot group ID")
 	} else {
 		// Keep the original tool schema when the optional bridge is disabled.
 		wsTool = mcp.NewTool("call_ws",
@@ -749,10 +752,41 @@ func bridgeToolResult(result bridge.Result, _ error) *mcp.CallToolResult {
 }
 
 func parseCompatOneBotID(raw json.RawMessage) (int64, error) {
+	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || string(raw) == "null" {
 		return 0, bridge.ErrInvalidRequest
 	}
-	return bridge.DecodeJSONNumber(raw)
+	var value string
+	if raw[0] == '"' {
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return 0, bridge.ErrInvalidRequest
+		}
+	} else {
+		value = string(raw)
+	}
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return 0, bridge.ErrInvalidRequest
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return 0, bridge.ErrInvalidRequest
+		}
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 || parsed > maxSafeOneBotID || strconv.FormatInt(parsed, 10) != value {
+		return 0, bridge.ErrInvalidRequest
+	}
+	return parsed, nil
+}
+
+func compatOneBotIDSchema(description string) map[string]any {
+	return map[string]any{
+		"description": description + ": safe positive integer or canonical decimal string",
+		"oneOf": []any{
+			map[string]any{"type": "integer", "minimum": int64(1), "maximum": maxSafeOneBotID},
+			map[string]any{"type": "string", "pattern": "^[1-9][0-9]{0,15}$", "maxLength": 16},
+		},
+	}
 }
 
 // The bridge remains optional. Keep the original request and reply behavior
