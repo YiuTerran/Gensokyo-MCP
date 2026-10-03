@@ -1,8 +1,10 @@
 package callapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/hoshinonyaruko/gensokyo-mcp/mylog"
 )
@@ -67,16 +69,17 @@ func (a *ActionMessage) UnmarshalJSON(data []byte) error {
 
 // params类型
 type ParamsContent struct {
-	BotQQ     string      `json:"botqq,omitempty"`
-	ChannelID interface{} `json:"channel_id,omitempty"`
-	GuildID   interface{} `json:"guild_id,omitempty"`
-	GroupID   interface{} `json:"group_id,omitempty"`   // 每一种onebotv11实现的字段类型都可能不同
-	MessageID interface{} `json:"message_id,omitempty"` // 用于撤回信息
-	Message   interface{} `json:"message,omitempty"`    // 这里使用interface{}因为它可能是多种类型
-	Messages  interface{} `json:"messages,omitempty"`   // 坑爹转发信息
-	UserID    interface{} `json:"user_id,omitempty"`    // 这里使用interface{}因为它可能是多种类型
-	Duration  int         `json:"duration,omitempty"`   // 可选的整数
-	Enable    bool        `json:"enable,omitempty"`     // 可选的布尔值
+	BotQQ       string      `json:"botqq,omitempty"`
+	ChannelID   interface{} `json:"channel_id,omitempty"`
+	GuildID     interface{} `json:"guild_id,omitempty"`
+	GroupID     interface{} `json:"group_id,omitempty"` // 每一种onebotv11实现的字段类型都可能不同
+	MessageType string      `json:"message_type,omitempty"`
+	MessageID   interface{} `json:"message_id,omitempty"` // 用于撤回信息
+	Message     interface{} `json:"message,omitempty"`    // 这里使用interface{}因为它可能是多种类型
+	Messages    interface{} `json:"messages,omitempty"`   // 坑爹转发信息
+	UserID      interface{} `json:"user_id,omitempty"`    // 这里使用interface{}因为它可能是多种类型
+	Duration    int         `json:"duration,omitempty"`   // 可选的整数
+	Enable      bool        `json:"enable,omitempty"`     // 可选的布尔值
 	// handle quick operation
 	Context   Context   `json:"context,omitempty"`   // context 字段
 	Operation Operation `json:"operation,omitempty"` // operation 字段
@@ -106,11 +109,11 @@ type Operation struct {
 func (p *ParamsContent) UnmarshalJSON(data []byte) error {
 	type Alias ParamsContent
 	aux := &struct {
-		GroupID   interface{} `json:"group_id"`
-		UserID    interface{} `json:"user_id"`
-		MessageID interface{} `json:"message_id"`
-		ChannelID interface{} `json:"channel_id"`
-		GuildID   interface{} `json:"guild_id"`
+		GroupID   json.RawMessage `json:"group_id"`
+		UserID    json.RawMessage `json:"user_id"`
+		MessageID json.RawMessage `json:"message_id"`
+		ChannelID json.RawMessage `json:"channel_id"`
+		GuildID   json.RawMessage `json:"guild_id"`
 		*Alias
 	}{
 		Alias: (*Alias)(p),
@@ -119,62 +122,46 @@ func (p *ParamsContent) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	switch v := aux.GroupID.(type) {
-	case nil: // 当GroupID不存在时
-		p.GroupID = ""
-	case float64: // JSON的数字默认被解码为float64
-		p.GroupID = fmt.Sprintf("%.0f", v) // 将其转换为字符串，忽略小数点后的部分
-	case string:
-		p.GroupID = v
-	default:
-		return fmt.Errorf("GroupID has unsupported type")
+	var err error
+	if p.GroupID, err = decodeCompatID(aux.GroupID, "group_id"); err != nil {
+		return err
 	}
-
-	switch v := aux.UserID.(type) {
-	case nil: // 当UserID不存在时
-		p.UserID = ""
-	case float64: // JSON的数字默认被解码为float64
-		p.UserID = fmt.Sprintf("%.0f", v) // 将其转换为字符串，忽略小数点后的部分
-	case string:
-		p.UserID = v
-	default:
-		return fmt.Errorf("UserID has unsupported type")
+	if p.UserID, err = decodeCompatID(aux.UserID, "user_id"); err != nil {
+		return err
 	}
-
-	switch v := aux.MessageID.(type) {
-	case nil: // 当UserID不存在时
-		p.MessageID = ""
-	case float64: // JSON的数字默认被解码为float64
-		p.MessageID = fmt.Sprintf("%.0f", v) // 将其转换为字符串，忽略小数点后的部分
-	case string:
-		p.MessageID = v
-	default:
-		return fmt.Errorf("MessageID has unsupported type")
+	if p.MessageID, err = decodeCompatID(aux.MessageID, "message_id"); err != nil {
+		return err
 	}
-
-	switch v := aux.ChannelID.(type) {
-	case nil: // 当ChannelID不存在时
-		p.ChannelID = ""
-	case float64: // JSON的数字默认被解码为float64
-		p.ChannelID = fmt.Sprintf("%.0f", v) // 将其转换为字符串，忽略小数点后的部分
-	case string:
-		p.ChannelID = v
-	default:
-		return fmt.Errorf("MessageID has unsupported type")
+	if p.ChannelID, err = decodeCompatID(aux.ChannelID, "channel_id"); err != nil {
+		return err
 	}
-
-	switch v := aux.GuildID.(type) {
-	case nil: // 当GuildID不存在时
-		p.GuildID = ""
-	case float64: // JSON的数字默认被解码为float64
-		p.GuildID = fmt.Sprintf("%.0f", v) // 将其转换为字符串，忽略小数点后的部分
-	case string:
-		p.GuildID = v
-	default:
-		return fmt.Errorf("MessageID has unsupported type")
+	if p.GuildID, err = decodeCompatID(aux.GuildID, "guild_id"); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func decodeCompatID(raw json.RawMessage, field string) (interface{}, error) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text, nil // retain legacy opaque string identifiers exactly
+	}
+	var number json.Number
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&number); err != nil {
+		return nil, fmt.Errorf("%s has unsupported type", field)
+	}
+	value, err := strconv.ParseInt(string(number), 10, 64)
+	const maxSafe = int64(9_007_199_254_740_991)
+	if err != nil || value > maxSafe || value < -maxSafe {
+		return nil, fmt.Errorf("%s must be a safe integer", field)
+	}
+	return strconv.FormatInt(value, 10), nil
 }
 
 // Message represents a standardized structure for the incoming messages.
