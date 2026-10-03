@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+config.yml
+*.db
+*.db.lock
+log/
+logs/
+data/
+output/
+reference/nonebot-bridge/.venv/
+reference/nonebot-bridge/__pycache__/
+reference/nonebot-bridge/.pytest_cache/

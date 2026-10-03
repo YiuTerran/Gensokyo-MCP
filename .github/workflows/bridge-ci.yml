@@ -1,0 +1,205 @@
+name: Bridge protocol and Docker release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gensokyo-bridge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: Run protocol and race tests
+        run: go test -race ./...
+      - name: Vet Go packages
+        run: go vet ./...
+      - name: Build server binary
+        run: go build -trimpath -o gensokyo-mcp .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gensokyo-mcp-linux-amd64
+          path: gensokyo-mcp
+          if-no-files-found: error
+
+  nonebot:
+    needs: go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: reference/nonebot-bridge/uv.lock
+      - uses: actions/download-artifact@v4
+        with:
+          name: gensokyo-mcp-linux-amd64
+          path: /tmp/gensokyo-bin
+      - run: chmod +x /tmp/gensokyo-bin/gensokyo-mcp
+      - name: Install pinned real NoneBot backend
+        working-directory: reference/nonebot-bridge
+        run: uv sync --locked
+      - name: Run real asynchronous OneBot acceptance
+        working-directory: reference/nonebot-bridge
+        env:
+          GENSOKYO_BINARY: /tmp/gensokyo-bin/gensokyo-mcp
+        run: uv run --locked python test_integration.py
+
+  validate_container:
+    name: Build and smoke-test ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          load: true
+          push: false
+          platforms: ${{ matrix.platform }}
+          tags: gensokyo-mcp:test-${{ matrix.arch }}
+      - name: Start image and verify health/internal auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name gensokyo-smoke-${{ matrix.arch }} \
+            -p 127.0.0.1::8090 \
+            -e LLM_BRIDGE_ENABLED=true \
+            -e LLM_BRIDGE_MCP_TOKEN=smoke-mcp-token \
+            -e LLM_BRIDGE_INTERNAL_TOKEN=smoke-internal-token \
+            -e LLM_BRIDGE_DATA_DIR=/data \
+            -e ONEBOT_WS_TOKEN=smoke-onebot-token \
+            -e ONEBOT_WS_URL=ws://127.0.0.1:1/ws \
+            -e ONEBOT_BACKEND_ID=sealdice \
+            gensokyo-mcp:test-${{ matrix.arch }}
+          port="$(docker port gensokyo-smoke-${{ matrix.arch }} 8090/tcp | head -n1)"
+          for attempt in $(seq 1 40); do
+            if curl --silent --fail "http://${port}/healthz" >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail "http://${port}/healthz" | jq -e '.status == "ok"'
+          curl --fail -H 'Authorization: Bearer smoke-internal-token' \
+            "http://${port}/internal/backends" | jq -e '.backends | length == 1 and .[0].id == "sealdice" and .[0].ready == false'
+          if curl --silent --fail -H 'Authorization: Bearer wrong-token' \
+            "http://${port}/internal/backends" >/dev/null; then
+            echo 'internal endpoint accepted the wrong token' >&2
+            exit 1
+          fi
+          docker stop gensokyo-smoke-${{ matrix.arch }}
+
+  publish_architecture:
+    name: Validate and publish ${{ matrix.platform }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [go, nonebot, validate_container]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    environment: deploy
+    env:
+      IMAGE: tryao/gensokyo-mcp
+      TAG: ${{ github.ref_name }}
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_SECRET: ${{ secrets.DOCKERHUB_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_SECRET }}
+      - name: Build and push architecture digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.TAG }}
+      - name: Save architecture digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  publish_manifest:
+    name: Publish version-only multi-architecture tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish_architecture
+    runs-on: ubuntu-24.04
+    environment: deploy
+    env:
+      IMAGE: tryao/gensokyo-mcp
+      TAG: ${{ github.ref_name }}
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_SECRET: ${{ secrets.DOCKERHUB_SECRET }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_SECRET }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+      - name: Create and verify version manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t DIGESTS < <(find /tmp/digests -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${#DIGESTS[@]}" -eq 2 ]]
+          for digest in "${DIGESTS[@]}"; do [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; done
+          docker buildx imagetools create --tag "$IMAGE:$TAG" \
+            "$IMAGE@sha256:${DIGESTS[0]}" "$IMAGE@sha256:${DIGESTS[1]}"
+          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > /tmp/manifest.json
+          jq -e '[.manifests[] | select(.platform.architecture != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' /tmp/manifest.json
