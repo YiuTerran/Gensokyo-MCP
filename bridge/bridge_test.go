@@ -2,9 +2,13 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -315,6 +319,176 @@ func TestOpaqueIdentityMappingPersistsAndNumericIDsCannotCollide(t *testing.T) {
 	user2, err := m2.MapIdentity("sealdice", "user", "sdk-user-1")
 	if err != nil || user2 != user {
 		t.Fatalf("mapping not persistent: %d %d err=%v", user, user2, err)
+	}
+}
+
+func TestParseMasterUserKeysFailsClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		ok   bool
+		want []string
+	}{
+		{name: "unset", raw: "", ok: true, want: []string{}},
+		{name: "empty", raw: `[]`, ok: true, want: []string{}},
+		{name: "valid", raw: `["123:openid_1","987654321:openid-2"]`, ok: true, want: []string{"123:openid_1", "987654321:openid-2"}},
+		{name: "non-array", raw: `{"key":"app:openid"}`, want: []string{}},
+		{name: "non-string", raw: `[1]`, want: []string{}},
+		{name: "missing-app", raw: `[:openid]`, want: []string{}},
+		{name: "missing-openid", raw: `["app:"]`, want: []string{}},
+		{name: "duplicate", raw: `["123:openid","123:openid","456:another"]`, ok: true, want: []string{"123:openid", "456:another"}},
+		{name: "nonnumeric app id", raw: `["app:openid"]`, want: []string{}},
+		{name: "spaces rejected", raw: `["123:open id"]`, want: []string{}},
+		{name: "colon rejected in openid", raw: `["123:open:id"]`, want: []string{}},
+		{name: "newline", raw: `["123:open\nid"]`, want: []string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := ParseMasterUserKeys(test.raw)
+			if ok != test.ok || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("ParseMasterUserKeys(%q) = %#v, %v; want %#v, %v", test.raw, got, ok, test.want, test.ok)
+			}
+		})
+	}
+	tooMany := make([]string, 101)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("%d:id", i+1)
+	}
+	raw, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ParseMasterUserKeys(string(raw)); ok || len(got) != 0 {
+		t.Fatalf("over-limit identity config was not rejected fail-closed: count=%d valid=%v", len(got), ok)
+	}
+}
+
+func TestRegistrationCapabilitiesAreBoundedAndUnique(t *testing.T) {
+	if !validCapabilities([]string{"reply", "complete", "master-acl-v1"}) {
+		t.Fatal("valid capability set rejected")
+	}
+	if validCapabilities([]string{"reply", "complete", "reply"}) {
+		t.Fatal("duplicate capabilities accepted")
+	}
+	if validCapabilities([]string{"reply", strings.Repeat("x", 65)}) {
+		t.Fatal("oversized capability accepted")
+	}
+	tooMany := make([]string, 33)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("cap-%d", i)
+	}
+	if validCapabilities(tooMany) {
+		t.Fatal("over-limit capability set accepted")
+	}
+}
+
+func TestMasterACLIsNegotiatedAndBoundToBackendConnection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bridge.db")
+	m, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.ConfigureBackends([]string{"backend-a", "backend-b"})
+	m.SetMasterUserKeys([]string{"app:master-openid"})
+	t.Cleanup(func() { _ = m.Close() })
+
+	legacy, err := m.Register("backend-a", "legacy-socket", RegisterParams{Version: 1, BackendInstance: "legacy", Capabilities: []string{"reply", "complete"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.RegistrationAuthorization("backend-a", legacy); ok {
+		t.Fatal("old backend received an ACL without negotiating master-acl-v1")
+	}
+	if err := m.Activate("backend-a", "legacy-socket", legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	connA, err := m.Register("backend-a", "acl-socket", RegisterParams{Version: 1, BackendInstance: "acl", Capabilities: []string{"reply", "complete", "master-acl-v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authA, ok := m.RegistrationAuthorization("backend-a", connA)
+	if !ok || authA.Version != 1 || len(authA.MasterUserIDs) != 1 {
+		t.Fatalf("negotiated ACL missing: %+v %v", authA, ok)
+	}
+	if err := m.Activate("backend-a", "acl-socket", connA); err != nil {
+		t.Fatal(err)
+	}
+	connB, err := m.Register("backend-b", "other-socket", RegisterParams{Version: 1, BackendInstance: "other", Capabilities: []string{"reply", "complete", "master-acl-v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authB, ok := m.RegistrationAuthorization("backend-b", connB)
+	if !ok || len(authB.MasterUserIDs) != 1 || authA.MasterUserIDs[0] == authB.MasterUserIDs[0] {
+		t.Fatalf("backend identities were not isolated: A=%+v B=%+v ok=%v", authA, authB, ok)
+	}
+	if _, ok := m.RegistrationAuthorization("backend-a", legacy); ok {
+		t.Fatal("replaced connection retained its old authorization")
+	}
+	for _, status := range m.Backends() {
+		if status.ID == "backend-a" && !hasCapability(status.Capabilities, "master-acl-v1") {
+			t.Fatalf("discovery omitted negotiated ACL capability: %+v", status)
+		}
+		if status.ID == "backend-b" && hasCapability(status.Capabilities, "master-acl-v1") == false {
+			t.Fatalf("discovery omitted negotiated ACL capability: %+v", status)
+		}
+	}
+}
+
+func TestEmptyMasterUserListNegotiatesAnEmptyDenyList(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	conn, err := m.Register("sealdice", "socket-empty", RegisterParams{Version: 1, BackendInstance: "empty", Capabilities: []string{"reply", "complete", "master-acl-v1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization, ok := m.RegistrationAuthorization("sealdice", conn)
+	if !ok || authorization.Version != 1 || authorization.MasterUserIDs == nil || len(authorization.MasterUserIDs) != 0 {
+		t.Fatalf("empty configuration did not return an empty deny list: %+v %v", authorization, ok)
+	}
+}
+
+func TestMasterACLIDsFollowStableKeysAfterDatabaseReset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bridge.db")
+	openWithACL := func(preallocate int) (*Manager, Authorization) {
+		m, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.ConfigureBackends([]string{"sealdice"})
+		for i := 0; i < preallocate; i++ {
+			if _, err := m.MapIdentity("sealdice", "user", fmt.Sprintf("unrelated-%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m.SetMasterUserKeys([]string{"app:master", "app:other"})
+		conn, err := m.Register("sealdice", "socket", RegisterParams{Version: 1, BackendInstance: "instance", Capabilities: []string{"reply", "complete", "master-acl-v1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		auth, ok := m.RegistrationAuthorization("sealdice", conn)
+		if !ok || len(auth.MasterUserIDs) != 2 {
+			t.Fatalf("missing identity grants: %+v %v", auth, ok)
+		}
+		return m, auth
+	}
+	first, firstAuth := openWithACL(1)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	second, secondAuth := openWithACL(3)
+	defer second.Close()
+	if firstAuth.MasterUserIDs[0] == secondAuth.MasterUserIDs[0] {
+		t.Fatal("fixture expected a different allocation after clearing the identity database")
+	}
+	for i, key := range []string{"app:master", "app:other"} {
+		want, err := second.MapIdentity("sealdice", "user", key)
+		if err != nil || secondAuth.MasterUserIDs[i] != want {
+			t.Fatalf("authorization id for stable key %q = %d, MapIdentity = %d, err=%v", key, secondAuth.MasterUserIDs[i], want, err)
+		}
 	}
 }
 

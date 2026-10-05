@@ -369,6 +369,12 @@ func main() {
 			log.Fatal("bridge state store could not be opened")
 		}
 		defer wsBridge.Close()
+		masterUserKeys, valid := bridge.ParseMasterUserKeys(os.Getenv("LLM_BRIDGE_MASTER_USER_KEYS"))
+		if !valid {
+			// Never include configured identity keys in diagnostics.
+			log.Print("LLM_BRIDGE_MASTER_USER_KEYS is invalid; bridge Master ACL is disabled")
+		}
+		wsBridge.SetMasterUserKeys(masterUserKeys)
 		wsBridge.ConfigureBackends(backendIDs)
 	} else if err := wsclient.OpenMessageIDAllocator(filepath.Join(".", "message_ids.db")); err != nil {
 		log.Fatal("OneBot message ID allocator could not be opened")

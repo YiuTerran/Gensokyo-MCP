@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ var (
 	ErrBadCompletion      = errors.New("completion did not match accepted outputs")
 	ErrAlreadyClaimed     = errors.New("private delivery has already been claimed")
 	ErrNotFound           = errors.New("record not found")
+	masterUserKeyPattern  = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
 )
 
 type Request struct {
@@ -77,9 +79,15 @@ type RegisterParams struct {
 }
 
 type BackendStatus struct {
-	ID      string `json:"id"`
-	Ready   bool   `json:"ready"`
-	Version int    `json:"version"`
+	ID           string   `json:"id"`
+	Ready        bool     `json:"ready"`
+	Version      int      `json:"version"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+type Authorization struct {
+	Version       int     `json:"version"`
+	MasterUserIDs []int64 `json:"master_user_ids"`
 }
 
 type PrivateOutput struct {
@@ -153,12 +161,13 @@ type job struct {
 }
 
 type backend struct {
-	status     BackendStatus
-	socket     string
-	conn       string
-	instance   string
-	quarantine *diskQuarantine
-	queue      chan job
+	status        BackendStatus
+	socket        string
+	conn          string
+	instance      string
+	authorization *Authorization
+	quarantine    *diskQuarantine
+	queue         chan job
 }
 
 type Manager struct {
@@ -177,6 +186,7 @@ type Manager struct {
 	closing          bool
 	dispatches       sync.WaitGroup
 	readinessChanged func()
+	masterUserKeys   []string
 }
 
 var (
@@ -345,6 +355,41 @@ func (m *Manager) SetReadinessCallback(callback func()) {
 	m.mu.Unlock()
 }
 
+// SetMasterUserKeys configures stable source identities eligible for the
+// negotiated bridge-only Master ACL. Keys are never included in status or logs.
+func (m *Manager) SetMasterUserKeys(keys []string) {
+	copyKeys := append([]string(nil), keys...)
+	m.mu.Lock()
+	m.masterUserKeys = copyKeys
+	m.mu.Unlock()
+}
+
+// ParseMasterUserKeys reads a JSON string array of appId:originalSDKopenid
+// keys. Invalid input is rejected as a whole so callers can fail closed;
+// duplicate keys are collapsed while preserving their first occurrence.
+func ParseMasterUserKeys(raw string) ([]string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}, true
+	}
+	var keys []string
+	if err := json.Unmarshal([]byte(raw), &keys); err != nil || keys == nil || len(keys) > 100 {
+		return []string{}, false
+	}
+	seen := make(map[string]struct{}, len(keys))
+	unique := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if !masterUserKeyPattern.MatchString(key) {
+			return []string{}, false
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+	return unique, true
+}
+
 func (m *Manager) notifyReadinessLocked() {
 	if callback := m.readinessChanged; callback != nil {
 		go callback()
@@ -352,8 +397,21 @@ func (m *Manager) notifyReadinessLocked() {
 }
 
 func (m *Manager) Register(backendID, socketID string, params RegisterParams) (string, error) {
-	if !bounded(backendID, 128) || !bounded(socketID, 128) || params.Version != 1 || !bounded(params.BackendInstance, 128) || !hasCapabilities(params.Capabilities) {
+	if !bounded(backendID, 128) || !bounded(socketID, 128) || params.Version != 1 || !bounded(params.BackendInstance, 128) || !hasCapabilities(params.Capabilities) || !validCapabilities(params.Capabilities) {
 		return "", ErrInvalidRequest
+	}
+	masterIDs := []int64{}
+	if hasCapability(params.Capabilities, "master-acl-v1") {
+		m.mu.Lock()
+		keys := append([]string(nil), m.masterUserKeys...)
+		m.mu.Unlock()
+		for _, key := range keys {
+			id, err := m.MapIdentity(backendID, "user", key)
+			if err != nil {
+				return "", err
+			}
+			masterIDs = append(masterIDs, id)
+		}
 	}
 	connectionID, err := randomID()
 	if err != nil {
@@ -392,6 +450,11 @@ func (m *Manager) Register(backendID, socketID string, params RegisterParams) (s
 	}
 	b.conn, b.socket = connectionID, socketID
 	b.instance = params.BackendInstance
+	b.authorization = nil
+	b.status.Capabilities = append([]string(nil), params.Capabilities...)
+	if hasCapability(params.Capabilities, "master-acl-v1") {
+		b.authorization = &Authorization{Version: 1, MasterUserIDs: append([]int64{}, masterIDs...)}
+	}
 	b.status.Ready, b.status.Version = false, 1
 	m.notifyReadinessLocked()
 	if old != "" {
@@ -422,6 +485,32 @@ func hasCapabilities(capabilities []string) bool {
 	return seen["reply"] && seen["complete"]
 }
 
+func hasCapability(capabilities []string, want string) bool {
+	for _, capability := range capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
+}
+
+func validCapabilities(capabilities []string) bool {
+	if len(capabilities) > 32 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		if !bounded(capability, 64) {
+			return false
+		}
+		if _, exists := seen[capability]; exists {
+			return false
+		}
+		seen[capability] = struct{}{}
+	}
+	return true
+}
+
 func (m *Manager) Disconnect(backendID, socketID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -435,8 +524,22 @@ func (m *Manager) Disconnect(backendID, socketID string) {
 	}
 	b.conn, b.socket = "", ""
 	b.status.Ready = false
+	b.status.Capabilities = nil
+	b.authorization = nil
 	m.notifyReadinessLocked()
 	m.finishConnectionLocked(backendID, old, ErrConnectionChanged, false)
+}
+
+// RegistrationAuthorization returns only the authorization negotiated by the
+// exact currently registered connection. Replaced sockets cannot reuse it.
+func (m *Manager) RegistrationAuthorization(backendID, connectionID string) (Authorization, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b := m.backends[backendID]
+	if b == nil || connectionID == "" || b.conn != connectionID || b.authorization == nil {
+		return Authorization{}, false
+	}
+	return Authorization{Version: b.authorization.Version, MasterUserIDs: append([]int64{}, b.authorization.MasterUserIDs...)}, true
 }
 
 func (m *Manager) finishConnectionLocked(backendID, connectionID string, err error, provenNewInstance bool) {
@@ -456,7 +559,9 @@ func (m *Manager) Backends() []BackendStatus {
 	defer m.mu.Unlock()
 	statuses := make([]BackendStatus, 0, len(m.backends))
 	for _, b := range m.backends {
-		statuses = append(statuses, b.status)
+		status := b.status
+		status.Capabilities = append([]string(nil), b.status.Capabilities...)
+		statuses = append(statuses, status)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].ID < statuses[j].ID })
 	return statuses

@@ -673,6 +673,9 @@ func (client *WebSocketClient) handleBridgeRegister(conn *websocket.Conn, socket
 		return
 	}
 	data := map[string]interface{}{"version": 1, "connection_id": connectionID}
+	if authorization, ok := manager.RegistrationAuthorization(client.backendID, connectionID); ok {
+		data["authorization"] = authorization
+	}
 	if err := client.writeBridgeAck(conn, wire.Echo, true, data, ""); err != nil {
 		manager.Disconnect(client.backendID, socketID)
 		return
