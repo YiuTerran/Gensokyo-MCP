@@ -22,26 +22,28 @@ import (
 )
 
 const (
-	QueueLimit           = 20 // waiting jobs per backend; the worker may own one more job.
-	ExecutionDeadline    = 30 * time.Second
-	MaxOutputsPerRequest = 64
-	MaxOutputTextBytes   = 128 * 1024
-	RequestTTL           = 24 * time.Hour
-	PrivateOutboxTTL     = 10 * time.Minute
-	identityIDStart      = int64(9_000_000_000_000_000)
-	identityIDFloor      = int64(8_000_000_000_000_000)
+	QueueLimit            = 20 // waiting jobs per backend; the worker may own one more job.
+	ExecutionDeadline     = 30 * time.Second
+	MaxOutputsPerRequest  = 64
+	MaxOutputTextBytes    = 128 * 1024
+	RequestTTL            = 24 * time.Hour
+	PrivateOutboxTTL      = 10 * time.Minute
+	CapabilityGroupRoleV1 = "group-role-v1"
+	identityIDStart       = int64(9_000_000_000_000_000)
+	identityIDFloor       = int64(8_000_000_000_000_000)
 )
 
 var (
-	ErrInvalidRequest     = errors.New("invalid bridge request")
-	ErrQueueFull          = errors.New("backend request queue is full")
-	ErrRequestConflict    = errors.New("request_id conflicts with a prior request")
-	ErrBackendUnavailable = errors.New("backend is not registered")
-	ErrConnectionChanged  = errors.New("backend connection changed")
-	ErrBadCompletion      = errors.New("completion did not match accepted outputs")
-	ErrAlreadyClaimed     = errors.New("private delivery has already been claimed")
-	ErrNotFound           = errors.New("record not found")
-	masterUserKeyPattern  = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
+	ErrInvalidRequest        = errors.New("invalid bridge request")
+	ErrCapabilityUnsupported = errors.New("backend does not support the requested capability")
+	ErrQueueFull             = errors.New("backend request queue is full")
+	ErrRequestConflict       = errors.New("request_id conflicts with a prior request")
+	ErrBackendUnavailable    = errors.New("backend is not registered")
+	ErrConnectionChanged     = errors.New("backend connection changed")
+	ErrBadCompletion         = errors.New("completion did not match accepted outputs")
+	ErrAlreadyClaimed        = errors.New("private delivery has already been claimed")
+	ErrNotFound              = errors.New("record not found")
+	masterUserKeyPattern     = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
 )
 
 type Request struct {
@@ -53,6 +55,7 @@ type Request struct {
 	GroupKey  string `json:"group_key,omitempty"`
 	UserID    int64  `json:"user_id,omitempty"`
 	GroupID   int64  `json:"group_id,omitempty"`
+	GroupRole string `json:"group_role,omitempty"`
 }
 
 type Output struct {
@@ -545,6 +548,12 @@ func (m *Manager) RegistrationAuthorization(backendID, connectionID string) (Aut
 func (m *Manager) finishConnectionLocked(backendID, connectionID string, err error, provenNewInstance bool) {
 	for _, call := range m.records {
 		if call.request.BackendID == backendID && call.connectionID == connectionID && call.state != "done" {
+			if call.state == "queued" && call.request.GroupRole != "" {
+				if current := m.backends[backendID]; current != nil && !hasCapability(current.status.Capabilities, CapabilityGroupRoleV1) {
+					_ = m.finishStateLocked(call, "failed", ErrCapabilityUnsupported, nil)
+					continue
+				}
+			}
 			if provenNewInstance {
 				_ = m.finishStateLocked(call, "unknown", err, nil)
 			} else {
@@ -631,6 +640,10 @@ func (m *Manager) Call(ctx context.Context, request Request, dispatch func(conte
 		m.mu.Unlock()
 		return Result{}, ErrBackendUnavailable
 	}
+	if request.GroupRole != "" && !hasCapability(b.status.Capabilities, CapabilityGroupRoleV1) {
+		m.mu.Unlock()
+		return Result{RequestID: request.RequestID, BackendID: request.BackendID, Audience: request.Audience, Status: "failed", Outputs: []Output{}}, ErrCapabilityUnsupported
+	}
 	if len(b.queue) >= cap(b.queue) {
 		m.mu.Unlock()
 		return Result{}, ErrQueueFull
@@ -696,12 +709,24 @@ func validRequest(request Request) bool {
 		return false
 	}
 	if request.Audience == "group" {
+		if request.GroupRole != "" && !validGroupRole(request.GroupRole) {
+			return false
+		}
 		if identity {
 			return bounded(request.GroupKey, 512) && !strings.ContainsAny(request.GroupKey, "\x00\r\n") && request.GroupID >= identityIDFloor && request.GroupID < identityIDStart
 		}
 		return request.GroupKey == "" && request.GroupID > 0 && request.GroupID < identityIDFloor
 	}
-	return request.GroupKey == "" && request.GroupID == 0
+	return request.GroupKey == "" && request.GroupID == 0 && request.GroupRole == ""
+}
+
+func validGroupRole(role string) bool {
+	switch role {
+	case "owner", "admin", "member":
+		return true
+	default:
+		return false
+	}
 }
 
 func waitCall(ctx context.Context, call *callState) (Result, error) {
@@ -736,6 +761,11 @@ func (m *Manager) execute(backendID string, queued job) {
 	}
 	if err := queued.ctx.Err(); err != nil {
 		_ = m.finishUnknownLocked(call, err)
+		m.mu.Unlock()
+		return
+	}
+	if b != nil && call.request.GroupRole != "" && !hasCapability(b.status.Capabilities, CapabilityGroupRoleV1) {
+		_ = m.finishStateLocked(call, "failed", ErrCapabilityUnsupported, nil)
 		m.mu.Unlock()
 		return
 	}

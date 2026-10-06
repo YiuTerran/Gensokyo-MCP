@@ -248,6 +248,7 @@ func NewGensokyoServer() *GensokyoServer {
 			mcp.WithString("audience", mcp.Description("group or private")),
 			mcp.WithString("user_key", mcp.Description("Trusted opaque user identity")),
 			mcp.WithString("group_key", mcp.Description("Trusted opaque group identity")),
+			mcp.WithString("group_role", mcp.Description("Trusted current-group role snapshot: owner, admin, or member; omit or pass an empty string when unknown")),
 			mcp.WithNumber("user_id", mcp.Description("Compatibility OneBot user ID: a safe positive integer or canonical decimal string")),
 			mcp.WithNumber("group_id", mcp.Description("Compatibility OneBot group ID: a safe positive integer or canonical decimal string")),
 		)
@@ -676,12 +677,23 @@ func callWS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, 
 		BackendID string          `json:"backend_id"`
 		RequestID string          `json:"request_id"`
 		Audience  string          `json:"audience"`
+		GroupRole json.RawMessage `json:"group_role"`
 	}
 	if err := req.BindArguments(&args); err != nil {
 		return mcp.NewToolResultError("invalid call_ws arguments"), nil
 	}
 	if args.Audience == "" {
 		args.Audience = "group"
+	}
+	groupRole := ""
+	if len(args.GroupRole) != 0 {
+		if args.Audience == "private" {
+			return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, bridge.ErrInvalidRequest), nil
+		}
+		roleJSON := bytes.TrimSpace(args.GroupRole)
+		if len(roleJSON) == 0 || roleJSON[0] != '"' || json.Unmarshal(roleJSON, &groupRole) != nil || (groupRole != "" && groupRole != "owner" && groupRole != "admin" && groupRole != "member") {
+			return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, bridge.ErrInvalidRequest), nil
+		}
 	}
 	if args.BackendID == "" || args.RequestID == "" || args.Payload == "" {
 		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
@@ -711,7 +723,7 @@ func callWS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, 
 	if err != nil {
 		return bridgeToolResult(bridge.Result{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Status: "failed", Outputs: []bridge.Output{}}, nil), nil
 	}
-	bridgeRequest := bridge.Request{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Payload: args.Payload, UserKey: args.UserKey, GroupKey: args.GroupKey, UserID: userID, GroupID: groupID}
+	bridgeRequest := bridge.Request{BackendID: args.BackendID, RequestID: args.RequestID, Audience: args.Audience, Payload: args.Payload, UserKey: args.UserKey, GroupKey: args.GroupKey, UserID: userID, GroupID: groupID, GroupRole: groupRole}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	unregister, registered := registerRPCCancel(callCtx, cancel)
@@ -726,7 +738,7 @@ func callWS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, 
 		if client == nil {
 			return bridge.ErrBackendUnavailable
 		}
-		event, buildErr := Processor.BuildBridgeEvent(args.Payload, args.Audience, userID, groupID, sourceID)
+		event, buildErr := Processor.BuildBridgeEventWithRole(args.Payload, args.Audience, userID, groupID, sourceID, groupRole)
 		if buildErr != nil {
 			return bridge.ErrInvalidRequest
 		}

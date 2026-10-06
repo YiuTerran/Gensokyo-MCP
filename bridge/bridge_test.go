@@ -33,8 +33,12 @@ func openManager(t *testing.T, path string) *Manager {
 }
 
 func register(t *testing.T, m *Manager, socket string) string {
+	return registerWithCapabilities(t, m, socket, "nonebot-test", []string{"reply", "complete"})
+}
+
+func registerWithCapabilities(t *testing.T, m *Manager, socket, instance string, capabilities []string) string {
 	t.Helper()
-	conn, err := m.Register("sealdice", socket, RegisterParams{Version: 1, BackendInstance: "nonebot-test", Capabilities: []string{"reply", "complete"}})
+	conn, err := m.Register("sealdice", socket, RegisterParams{Version: 1, BackendInstance: instance, Capabilities: capabilities})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,6 +326,37 @@ func TestOpaqueIdentityMappingPersistsAndNumericIDsCannotCollide(t *testing.T) {
 	}
 }
 
+func TestRequestIDConflictIncludesGroupRole(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	conn := registerWithCapabilities(t, m, "role-conflict-socket", "role-aware", []string{"reply", "complete", CapabilityGroupRoleV1})
+	request := groupRequest("role-conflict")
+	request.GroupRole = "owner"
+	dispatched := make(chan int32, 1)
+	completed := make(chan error, 1)
+	go func() {
+		_, err := m.Call(context.Background(), request, func(_ context.Context, _, _ string, id int32) error {
+			dispatched <- id
+			return nil
+		})
+		completed <- err
+	}()
+	id := waitMessageID(t, dispatched)
+	changedRole := request
+	changedRole.GroupRole = "admin"
+	if _, err := m.Call(context.Background(), changedRole, func(context.Context, string, string, int32) error { return nil }); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("request ID reused with a different role was accepted: %v", err)
+	}
+	if err := m.Deliver("sealdice", conn, id, "send_group_msg", "group", 22001, "done"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Complete("sealdice", conn, id, "ok", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-completed; err != nil {
+		t.Fatalf("original request failed: %v", err)
+	}
+}
+
 func TestParseMasterUserKeysFailsClosed(t *testing.T) {
 	tests := []struct {
 		name string
@@ -364,7 +399,7 @@ func TestParseMasterUserKeysFailsClosed(t *testing.T) {
 }
 
 func TestRegistrationCapabilitiesAreBoundedAndUnique(t *testing.T) {
-	if !validCapabilities([]string{"reply", "complete", "master-acl-v1"}) {
+	if !validCapabilities([]string{"reply", "complete", "master-acl-v1", CapabilityGroupRoleV1}) {
 		t.Fatal("valid capability set rejected")
 	}
 	if validCapabilities([]string{"reply", "complete", "reply"}) {
@@ -379,6 +414,244 @@ func TestRegistrationCapabilitiesAreBoundedAndUnique(t *testing.T) {
 	}
 	if validCapabilities(tooMany) {
 		t.Fatal("over-limit capability set accepted")
+	}
+}
+
+func TestGroupRoleCapabilityIsNegotiatedAndExposed(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	conn, err := m.Register("sealdice", "role-socket", RegisterParams{
+		Version: 1, BackendInstance: "role-aware", Capabilities: []string{"reply", "complete", CapabilityGroupRoleV1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Activate("sealdice", "role-socket", conn); err != nil {
+		t.Fatal(err)
+	}
+	statuses := m.Backends()
+	if len(statuses) != 1 || !hasCapability(statuses[0].Capabilities, CapabilityGroupRoleV1) {
+		t.Fatalf("negotiated group-role capability was not exposed: %+v", statuses)
+	}
+}
+
+func TestRequestGroupRoleValidation(t *testing.T) {
+	for _, role := range []string{"", "owner", "admin", "member"} {
+		request := groupRequest("role-" + role)
+		request.GroupRole = role
+		if !validRequest(request) {
+			t.Errorf("valid group role %q was rejected", role)
+		}
+	}
+	for _, role := range []string{"moderator", "ADMIN", " owner", "member\n"} {
+		request := groupRequest("invalid-role")
+		request.GroupRole = role
+		if validRequest(request) {
+			t.Errorf("invalid group role %q was accepted", role)
+		}
+	}
+	private := Request{BackendID: "sealdice", RequestID: "private-role", Audience: "private", Payload: ".test", UserID: 11001, GroupRole: "admin"}
+	if validRequest(private) {
+		t.Fatal("private request accepted a group role")
+	}
+	private.GroupRole = ""
+	if !validRequest(private) {
+		t.Fatal("legacy private request without a group role was rejected")
+	}
+}
+
+func TestGroupRoleRequestsRequireCurrentConnectionCapability(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	roleCapabilities := []string{"reply", "complete", CapabilityGroupRoleV1}
+	roleConn := registerWithCapabilities(t, m, "role-socket", "role-aware", roleCapabilities)
+	m.Disconnect("sealdice", "role-socket")
+	legacyConn := registerWithCapabilities(t, m, "legacy-socket", "legacy", []string{"reply", "complete"})
+	if err := m.Activate("sealdice", "legacy-socket", legacyConn); err != nil {
+		t.Fatal(err)
+	}
+	if legacyConn == roleConn {
+		t.Fatal("reconnect reused the prior connection identity")
+	}
+	for _, status := range m.Backends() {
+		if hasCapability(status.Capabilities, CapabilityGroupRoleV1) {
+			t.Fatalf("legacy reconnect retained the old role capability: %+v", status)
+		}
+	}
+
+	var roleDispatches atomic.Int32
+	roleRequest := groupRequest("role-after-downgrade")
+	roleRequest.GroupRole = "owner"
+	result, err := m.Call(context.Background(), roleRequest, func(context.Context, string, string, int32) error {
+		roleDispatches.Add(1)
+		return nil
+	})
+	if !errors.Is(err, ErrCapabilityUnsupported) || result.Status != "failed" || roleDispatches.Load() != 0 {
+		t.Fatalf("role request crossed a legacy connection: result=%+v err=%v dispatches=%d", result, err, roleDispatches.Load())
+	}
+
+	query := groupRequest("ordinary-after-downgrade")
+	result, err = m.Call(context.Background(), query, func(_ context.Context, connectionID, _ string, id int32) error {
+		return m.Complete("sealdice", connectionID, id, "ok", 0)
+	})
+	if err != nil || result.Status != "ok" {
+		t.Fatalf("legacy no-role request was blocked: result=%+v err=%v", result, err)
+	}
+}
+
+type testCallResult struct {
+	result Result
+	err    error
+}
+
+func TestQueuedGroupRoleCallIsRejectedAfterCapabilityDowngradeReconnect(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	registerWithCapabilities(t, m, "role-socket", "role-aware", []string{"reply", "complete", CapabilityGroupRoleV1})
+	blockerStarted := make(chan int32, 1)
+	releaseBlocker := make(chan struct{})
+	blockerDone := make(chan testCallResult, 1)
+	go func() {
+		result, err := m.Call(context.Background(), groupRequest("role-free-blocker"), func(_ context.Context, connectionID, _ string, id int32) error {
+			blockerStarted <- id
+			<-releaseBlocker
+			return m.Complete("sealdice", connectionID, id, "ok", 0)
+		})
+		blockerDone <- testCallResult{result: result, err: err}
+	}()
+	_ = waitMessageID(t, blockerStarted)
+
+	request := groupRequest("queued-role-downgrade")
+	request.GroupRole = "admin"
+	dispatches := atomic.Int32{}
+	done := make(chan testCallResult, 1)
+	go func() {
+		result, err := m.Call(context.Background(), request, func(context.Context, string, string, int32) error {
+			dispatches.Add(1)
+			return nil
+		})
+		done <- testCallResult{result: result, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		call := m.records[requestKey(request.BackendID, request.RequestID)]
+		queued := call != nil && call.state == "queued"
+		m.mu.Unlock()
+		if queued {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.mu.Lock()
+	call := m.records[requestKey(request.BackendID, request.RequestID)]
+	queued := call != nil && call.state == "queued"
+	m.mu.Unlock()
+	if !queued {
+		close(releaseBlocker)
+		t.Fatal("role request was not queued before reconnect")
+	}
+
+	newConn, err := m.Register("sealdice", "legacy-socket", RegisterParams{Version: 1, BackendInstance: "legacy", Capabilities: []string{"reply", "complete"}})
+	if err != nil {
+		close(releaseBlocker)
+		t.Fatal(err)
+	}
+	if err := m.Activate("sealdice", "legacy-socket", newConn); err != nil {
+		close(releaseBlocker)
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, ErrCapabilityUnsupported) || got.result.Status != "failed" || dispatches.Load() != 0 {
+			t.Fatalf("queued role request crossed capability downgrade: result=%+v err=%v dispatches=%d", got.result, got.err, dispatches.Load())
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseBlocker)
+		t.Fatal("queued role request did not finish after capability downgrade")
+	}
+
+	close(releaseBlocker)
+	select {
+	case first := <-blockerDone:
+		if first.result.Status != "unknown" || !errors.Is(first.err, ErrConnectionChanged) {
+			t.Fatalf("old-connection request result changed: %+v err=%v", first.result, first.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old-connection request did not finish")
+	}
+
+	query := groupRequest("ordinary-after-queued-downgrade")
+	result, err := m.Call(context.Background(), query, func(_ context.Context, connectionID, _ string, id int32) error {
+		return m.Complete("sealdice", connectionID, id, "ok", 0)
+	})
+	if err != nil || result.Status != "ok" {
+		t.Fatalf("legacy no-role request was blocked after queued downgrade: %+v err=%v", result, err)
+	}
+}
+
+func TestExecuteRechecksGroupRoleCapabilityAfterQueueing(t *testing.T) {
+	m := openManager(t, filepath.Join(t.TempDir(), "bridge.db"))
+	registerWithCapabilities(t, m, "role-socket", "role-aware", []string{"reply", "complete", CapabilityGroupRoleV1})
+	blockerStarted := make(chan int32, 1)
+	releaseBlocker := make(chan struct{})
+	blockerDone := make(chan testCallResult, 1)
+	go func() {
+		result, err := m.Call(context.Background(), groupRequest("dispatch-check-blocker"), func(_ context.Context, connectionID, _ string, id int32) error {
+			blockerStarted <- id
+			<-releaseBlocker
+			return m.Complete("sealdice", connectionID, id, "ok", 0)
+		})
+		blockerDone <- testCallResult{result: result, err: err}
+	}()
+	_ = waitMessageID(t, blockerStarted)
+
+	request := groupRequest("dispatch-capability-recheck")
+	request.GroupRole = "owner"
+	dispatches := atomic.Int32{}
+	done := make(chan testCallResult, 1)
+	go func() {
+		result, err := m.Call(context.Background(), request, func(context.Context, string, string, int32) error {
+			dispatches.Add(1)
+			return nil
+		})
+		done <- testCallResult{result: result, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		call := m.records[requestKey(request.BackendID, request.RequestID)]
+		queued := call != nil && call.state == "queued"
+		m.mu.Unlock()
+		if queued {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.mu.Lock()
+	call := m.records[requestKey(request.BackendID, request.RequestID)]
+	if call == nil || call.state != "queued" {
+		m.mu.Unlock()
+		close(releaseBlocker)
+		t.Fatal("role request was not queued before dispatch capability changed")
+	}
+	// Simulate a capability snapshot downgrade between acceptance and worker
+	// dispatch. Production reconnects also fence this queued request in Register.
+	m.backends["sealdice"].status.Capabilities = []string{"reply", "complete"}
+	m.mu.Unlock()
+	close(releaseBlocker)
+	select {
+	case first := <-blockerDone:
+		if first.err != nil || first.result.Status != "ok" {
+			t.Fatalf("blocker request did not complete normally: %+v err=%v", first.result, first.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocker request did not finish")
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, ErrCapabilityUnsupported) || got.result.Status != "failed" || dispatches.Load() != 0 {
+			t.Fatalf("dispatch ignored current capability: result=%+v err=%v dispatches=%d", got.result, got.err, dispatches.Load())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued role request did not finish after capability downgrade")
 	}
 }
 

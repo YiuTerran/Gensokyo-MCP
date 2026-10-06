@@ -135,16 +135,26 @@ func (c *httpMCPClient) initialize(t *testing.T) {
 }
 
 func (c *httpMCPClient) call(ctx context.Context, rpcID any, requestID, payload string) (map[string]any, error) {
+	return c.callWithRole(ctx, rpcID, requestID, payload, "group", nil, false)
+}
+
+func (c *httpMCPClient) callWithRole(ctx context.Context, rpcID any, requestID, payload, audience string, role any, includeRole bool) (map[string]any, error) {
+	arguments := map[string]any{
+		"backend_id": httpFixtureBackend,
+		"request_id": requestID,
+		"audience":   audience,
+		"payload":    payload,
+		"user_id":    11001,
+	}
+	if audience == "group" {
+		arguments["group_id"] = 22001
+	}
+	if includeRole {
+		arguments["group_role"] = role
+	}
 	return c.rpc(ctx, rpcID, "tools/call", map[string]any{
-		"name": "call_ws",
-		"arguments": map[string]any{
-			"backend_id": httpFixtureBackend,
-			"request_id": requestID,
-			"audience":   "group",
-			"payload":    payload,
-			"user_id":    11001,
-			"group_id":   22001,
-		},
+		"name":      "call_ws",
+		"arguments": arguments,
 	})
 }
 
@@ -181,6 +191,7 @@ type fakeBackendAck struct {
 type fakeBackendEvent struct {
 	Payload  string
 	SourceID int32
+	Role     string
 }
 
 type pendingFakeAck struct {
@@ -310,7 +321,7 @@ func (b *fakeOneBotBackend) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	go b.readLoop(conn)
 	ack, err := b.sendAction("_llm_bridge_register", map[string]any{
-		"version": 1, "backend_instance": "go-http-fixture", "capabilities": []string{"reply", "complete"},
+		"version": 1, "backend_instance": "go-http-fixture", "capabilities": []string{"reply", "complete", bridge.CapabilityGroupRoleV1},
 	}, json.RawMessage(`{"register":["arbitrary",true,null,7]}`))
 	if err != nil || ack.Status != "ok" {
 		return
@@ -337,13 +348,16 @@ func (b *fakeOneBotBackend) readLoop(conn *websocket.Conn) {
 			return
 		}
 		var envelope struct {
-			PostType  string          `json:"post_type"`
-			Raw       string          `json:"raw_message"`
-			MessageID json.Number     `json:"message_id"`
-			Echo      json.RawMessage `json:"echo"`
-			Status    string          `json:"status"`
-			Retcode   int             `json:"retcode"`
-			Data      json.RawMessage `json:"data"`
+			PostType  string      `json:"post_type"`
+			Raw       string      `json:"raw_message"`
+			MessageID json.Number `json:"message_id"`
+			Sender    struct {
+				Role string `json:"role"`
+			} `json:"sender"`
+			Echo    json.RawMessage `json:"echo"`
+			Status  string          `json:"status"`
+			Retcode int             `json:"retcode"`
+			Data    json.RawMessage `json:"data"`
 		}
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.UseNumber()
@@ -368,7 +382,7 @@ func (b *fakeOneBotBackend) readLoop(conn *websocket.Conn) {
 		if err != nil || source <= 0 || source > math.MaxInt32 {
 			continue
 		}
-		event := fakeBackendEvent{Payload: envelope.Raw, SourceID: int32(source)}
+		event := fakeBackendEvent{Payload: envelope.Raw, SourceID: int32(source), Role: envelope.Sender.Role}
 		select {
 		case b.events <- event:
 		default:
@@ -567,6 +581,93 @@ func TestProductionHTTPMCPOneBotBridgeEndToEnd(t *testing.T) {
 	if backend.badEchoes.Load() != 0 || backend.accepted.Load() != 3 {
 		t.Fatalf("OneBot ACK/correlation fixture mismatch: changed echoes=%d accepted outputs=%d", backend.badEchoes.Load(), backend.accepted.Load())
 	}
+}
+
+func TestProductionHTTPBridgePassesAndValidatesGroupRole(t *testing.T) {
+	mcpClient, backend, manager, cleanup := newHTTPBridgeFixture(t)
+	defer cleanup()
+	mcpClient.initialize(t)
+	statuses := manager.Backends()
+	if len(statuses) != 1 || !bridgeCapabilityPresent(statuses[0].Capabilities, bridge.CapabilityGroupRoleV1) {
+		t.Fatalf("backend did not negotiate group-role-v1: %+v", statuses)
+	}
+
+	list, err := mcpClient.rpc(context.Background(), 19, "tools/list", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listResult, _ := list["result"].(map[string]any)
+	tools, _ := listResult["tools"].([]any)
+	var roleSchemaFound bool
+	for _, item := range tools {
+		tool, _ := item.(map[string]any)
+		if tool["name"] != "call_ws" {
+			continue
+		}
+		schema, _ := tool["inputSchema"].(map[string]any)
+		properties, _ := schema["properties"].(map[string]any)
+		_, roleSchemaFound = properties["group_role"]
+	}
+	if !roleSchemaFound {
+		t.Fatalf("call_ws schema omitted the trusted group_role field: %v", list)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	response, err := mcpClient.callWithRole(ctx, 20, "role-event", "role-event", "group", "admin", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, toolError := bridgeResultFromRPC(t, response)
+	if toolError || result.Status != "ok" {
+		t.Fatalf("valid group role call failed: %+v; %v", result, response)
+	}
+	event := backend.waitEvent(t, "role-event")
+	if event.Role != "admin" {
+		t.Fatalf("sender.role did not preserve the group role: %q", event.Role)
+	}
+	unknownResponse, err := mcpClient.callWithRole(ctx, 21, "unknown-role-event", "unknown-role-event", "group", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownResult, unknownToolError := bridgeResultFromRPC(t, unknownResponse)
+	if unknownToolError || unknownResult.Status != "ok" {
+		t.Fatalf("empty unknown group role was rejected: %+v; %v", unknownResult, unknownResponse)
+	}
+	unknownEvent := backend.waitEvent(t, "unknown-role-event")
+	if unknownEvent.Role != "" {
+		t.Fatalf("unknown role was defaulted in sender.role: %q", unknownEvent.Role)
+	}
+
+	for _, test := range []struct {
+		name, audience string
+		role           any
+	}{
+		{name: "invalid role", audience: "group", role: "moderator"},
+		{name: "null role", audience: "group", role: nil},
+		{name: "private role", audience: "private", role: "admin"},
+		{name: "private empty role", audience: "private", role: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failed, callErr := mcpClient.callWithRole(ctx, test.name, "reject-"+test.name, test.name, test.audience, test.role, true)
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			got, isError := bridgeResultFromRPC(t, failed)
+			if isError || got.Status != "failed" || len(got.Outputs) != 0 {
+				t.Fatalf("invalid role request was not rejected before dispatch: %+v; %v", got, failed)
+			}
+		})
+	}
+}
+
+func bridgeCapabilityPresent(capabilities []string, want string) bool {
+	for _, capability := range capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestProductionHTTPMCPDisconnectAndSessionCancellationQuarantine(t *testing.T) {
