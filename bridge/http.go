@@ -10,6 +10,7 @@ import (
 )
 
 const maxInternalBody = 16 * 1024
+const maxCaptureBody = 512 * 1024
 
 func HealthHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +80,67 @@ func InternalHandler(manager *Manager, token string) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
+	mux.Handle("/internal/log/events", protect(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var body LogEvent
+		if err := decodeBoundedJSONLimit(w, r, &body, maxCaptureBody); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		if err := manager.Capture(body); err != nil {
+			writeManagerError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+	}))
+	mux.Handle("/internal/artifacts/claim", protect(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			BackendID string `json:"backend_id"`
+			RequestID string `json:"request_id"`
+			Receipt   string `json:"receipt"`
+			GroupKey  string `json:"group_key"`
+		}
+		if err := decodeBoundedJSON(w, r, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		delivery, err := manager.ClaimArtifact(body.BackendID, body.RequestID, body.Receipt, body.GroupKey)
+		if err != nil {
+			writeManagerError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, delivery)
+	}))
+	mux.Handle("/internal/artifacts/ack", protect(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			BackendID  string `json:"backend_id"`
+			RequestID  string `json:"request_id"`
+			Receipt    string `json:"receipt"`
+			GroupKey   string `json:"group_key"`
+			DeliveryID string `json:"delivery_id"`
+			Status     string `json:"status"`
+		}
+		if err := decodeBoundedJSON(w, r, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		if err := manager.AckArtifact(body.BackendID, body.RequestID, body.Receipt, body.GroupKey, body.DeliveryID, body.Status); err != nil {
+			writeManagerError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}))
 	return mux
 }
 
@@ -88,7 +150,11 @@ func validBearer(header, token string) bool {
 }
 
 func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, target any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxInternalBody)
+	return decodeBoundedJSONLimit(w, r, target, maxInternalBody)
+}
+
+func decodeBoundedJSONLimit(w http.ResponseWriter, r *http.Request, target any, max int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, max)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -111,6 +177,16 @@ func writeManagerError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case errors.Is(err, ErrAlreadyClaimed):
 		status = http.StatusConflict
+	case errors.Is(err, ErrRequestConflict):
+		status = http.StatusConflict
+	case errors.Is(err, ErrCaptureQueueFull):
+		status = http.StatusTooManyRequests
+	case errors.Is(err, ErrCaptureStateUnavailable):
+		status = http.StatusServiceUnavailable
+	case errors.Is(err, ErrArtifactLimit):
+		status = http.StatusInsufficientStorage
+	case errors.Is(err, ErrCapabilityUnsupported):
+		status = http.StatusConflict
 	case errors.Is(err, ErrInvalidRequest):
 		status = http.StatusBadRequest
 	}
@@ -125,6 +201,16 @@ func sanitizeStatus(err error) string {
 		return "not_found"
 	case errors.Is(err, ErrInvalidRequest):
 		return "invalid_request"
+	case errors.Is(err, ErrRequestConflict):
+		return "request_conflict"
+	case errors.Is(err, ErrCaptureQueueFull):
+		return "queue_full"
+	case errors.Is(err, ErrCaptureStateUnavailable):
+		return "capture_state_unavailable"
+	case errors.Is(err, ErrArtifactLimit):
+		return "artifact_limit"
+	case errors.Is(err, ErrCapabilityUnsupported):
+		return "capability_unsupported"
 	default:
 		return "request_failed"
 	}

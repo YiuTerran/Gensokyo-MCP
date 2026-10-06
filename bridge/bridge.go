@@ -28,22 +28,36 @@ const (
 	MaxOutputTextBytes    = 128 * 1024
 	RequestTTL            = 24 * time.Hour
 	PrivateOutboxTTL      = 10 * time.Minute
+	CaptureEventLimit     = 10000
+	CaptureSeenLimit      = 50000
+	CaptureRejectedLimit  = 50000
+	CaptureQueueBytes     = 64 * 1024 * 1024
+	CaptureGapLimit       = 512
+	ArtifactTTL           = 10 * time.Minute
+	ArtifactCountLimit    = 20
+	ArtifactBytesLimit    = 64 * 1024 * 1024
+	ArtifactMaxBytes      = 10 * 1024 * 1024
 	CapabilityGroupRoleV1 = "group-role-v1"
 	identityIDStart       = int64(9_000_000_000_000_000)
 	identityIDFloor       = int64(8_000_000_000_000_000)
 )
 
 var (
-	ErrInvalidRequest        = errors.New("invalid bridge request")
-	ErrCapabilityUnsupported = errors.New("backend does not support the requested capability")
-	ErrQueueFull             = errors.New("backend request queue is full")
-	ErrRequestConflict       = errors.New("request_id conflicts with a prior request")
-	ErrBackendUnavailable    = errors.New("backend is not registered")
-	ErrConnectionChanged     = errors.New("backend connection changed")
-	ErrBadCompletion         = errors.New("completion did not match accepted outputs")
-	ErrAlreadyClaimed        = errors.New("private delivery has already been claimed")
-	ErrNotFound              = errors.New("record not found")
-	masterUserKeyPattern     = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
+	ErrInvalidRequest          = errors.New("invalid bridge request")
+	ErrCapabilityUnsupported   = errors.New("backend does not support the requested capability")
+	ErrQueueFull               = errors.New("backend request queue is full")
+	ErrRequestConflict         = errors.New("request_id conflicts with a prior request")
+	ErrBackendUnavailable      = errors.New("backend is not registered")
+	ErrConnectionChanged       = errors.New("backend connection changed")
+	ErrBadCompletion           = errors.New("completion did not match accepted outputs")
+	ErrAlreadyClaimed          = errors.New("private delivery has already been claimed")
+	ErrNotFound                = errors.New("record not found")
+	ErrCaptureQueueFull        = errors.New("capture queue is full")
+	ErrCaptureStateUnavailable = errors.New("capture state unavailable")
+	ErrArtifactLimit           = errors.New("artifact limit reached")
+	errCaptureRetryWait        = errors.New("capture retry delay has not elapsed")
+	errCaptureAckFailed        = errors.New("capture event was rejected by backend")
+	masterUserKeyPattern       = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
 )
 
 type Request struct {
@@ -66,13 +80,14 @@ type Output struct {
 }
 
 type Result struct {
-	RequestID      string   `json:"request_id"`
-	BackendID      string   `json:"backend_id"`
-	Audience       string   `json:"audience"`
-	Status         string   `json:"status"`
-	Outputs        []Output `json:"outputs"`
-	PrivateReceipt string   `json:"private_receipt,omitempty"`
-	PrivateCount   int      `json:"private_count,omitempty"`
+	RequestID        string            `json:"request_id"`
+	BackendID        string            `json:"backend_id"`
+	Audience         string            `json:"audience"`
+	Status           string            `json:"status"`
+	Outputs          []Output          `json:"outputs"`
+	PrivateReceipt   string            `json:"private_receipt,omitempty"`
+	PrivateCount     int               `json:"private_count,omitempty"`
+	ArtifactReceipts []ArtifactReceipt `json:"artifact_receipts,omitempty"`
 }
 
 type RegisterParams struct {
@@ -89,8 +104,84 @@ type BackendStatus struct {
 }
 
 type Authorization struct {
-	Version       int     `json:"version"`
-	MasterUserIDs []int64 `json:"master_user_ids"`
+	Version        int               `json:"version"`
+	MasterUserIDs  []int64           `json:"master_user_ids"`
+	MasterUserKeys map[string]string `json:"master_user_keys,omitempty"`
+}
+
+type LogEvent struct {
+	BackendID string `json:"backend_id"`
+	EventID   string `json:"event_id"`
+	GroupKey  string `json:"group_key"`
+	UserKey   string `json:"user_key"`
+	Time      int64  `json:"time"`
+	Nickname  string `json:"nickname"`
+	Text      string `json:"text"`
+	IsBot     bool   `json:"is_bot"`
+	Kind      string `json:"kind"`
+}
+
+type LogEventFrame struct {
+	PostType     string `json:"post_type"`
+	Version      int    `json:"version"`
+	ConnectionID string `json:"connection_id"`
+	EventID      string `json:"event_id"`
+	GroupID      int64  `json:"group_id"`
+	UserID       int64  `json:"user_id"`
+	Time         int64  `json:"time"`
+	Nickname     string `json:"nickname"`
+	Text         string `json:"text"`
+	IsBot        bool   `json:"is_bot"`
+	Kind         string `json:"kind"`
+}
+
+type ArtifactReceipt struct {
+	Receipt   string `json:"receipt"`
+	Filename  string `json:"filename"`
+	MediaType string `json:"media_type"`
+	Size      int    `json:"size"`
+	SHA256    string `json:"sha256"`
+}
+
+type ArtifactDelivery struct {
+	DeliveryID string `json:"delivery_id"`
+	ArtifactReceipt
+	BytesBase64 string `json:"bytes_base64"`
+}
+
+type diskLogEvent struct {
+	Event          LogEvent `json:"event"`
+	GroupID        int64    `json:"group_id"`
+	UserID         int64    `json:"user_id"`
+	Order          uint64   `json:"order"`
+	CreatedAt      int64    `json:"created_at"`
+	QueueBytes     int      `json:"queue_bytes"`
+	InflightConn   string   `json:"inflight_connection_id,omitempty"`
+	InflightSocket string   `json:"inflight_socket_id,omitempty"`
+	RetryAt        int64    `json:"retry_at,omitempty"`
+	Attempts       int      `json:"attempts,omitempty"`
+	GapCount       int      `json:"gap_count,omitempty"`
+	GapFirstTime   int64    `json:"gap_first_time,omitempty"`
+	GapLastTime    int64    `json:"gap_last_time,omitempty"`
+	Mergeable      bool     `json:"mergeable,omitempty"`
+}
+
+type diskLogSeen struct {
+	Fingerprint string `json:"fingerprint"`
+	CreatedAt   int64  `json:"created_at"`
+	BackendID   string `json:"backend_id,omitempty"`
+	GapEventID  string `json:"gap_event_id,omitempty"`
+}
+
+type diskArtifact struct {
+	BackendID  string          `json:"backend_id"`
+	RequestID  string          `json:"request_id"`
+	GroupKey   string          `json:"group_key"`
+	CreatedAt  int64           `json:"created_at"`
+	Metadata   ArtifactReceipt `json:"metadata"`
+	Data       []byte          `json:"data"`
+	Claimed    bool            `json:"claimed"`
+	DeliveryID string          `json:"delivery_id,omitempty"`
 }
 
 type PrivateOutput struct {
@@ -104,16 +195,19 @@ type PrivateDelivery struct {
 }
 
 type diskRequest struct {
-	Fingerprint     string `json:"fingerprint"`
-	CreatedAt       int64  `json:"created_at"`
-	State           string `json:"state"`
-	Result          Result `json:"result"`
-	BackendInstance string `json:"backend_instance,omitempty"`
-	ConnectionID    string `json:"connection_id,omitempty"`
-	SocketID        string `json:"socket_id,omitempty"`
-	SourceID        int32  `json:"source_id,omitempty"`
-	AcceptedCount   int    `json:"accepted_count,omitempty"`
-	Receipt         string `json:"receipt,omitempty"`
+	Fingerprint      string            `json:"fingerprint"`
+	CreatedAt        int64             `json:"created_at"`
+	State            string            `json:"state"`
+	Result           Result            `json:"result"`
+	BackendInstance  string            `json:"backend_instance,omitempty"`
+	ConnectionID     string            `json:"connection_id,omitempty"`
+	SocketID         string            `json:"socket_id,omitempty"`
+	SourceID         int32             `json:"source_id,omitempty"`
+	AcceptedCount    int               `json:"accepted_count,omitempty"`
+	Receipt          string            `json:"receipt,omitempty"`
+	GroupKey         string            `json:"group_key,omitempty"`
+	Order            uint64            `json:"order,omitempty"`
+	ArtifactReceipts []ArtifactReceipt `json:"artifact_receipts,omitempty"`
 }
 
 type diskQuarantine struct {
@@ -148,6 +242,8 @@ type callState struct {
 	outputs         []Output
 	outputBytes     int
 	acceptedCount   int
+	order           uint64
+	artifacts       []ArtifactReceipt
 	private         []PrivateOutput
 	receipt         string
 	createdAt       int64
@@ -164,40 +260,50 @@ type job struct {
 }
 
 type backend struct {
-	status        BackendStatus
-	socket        string
-	conn          string
-	instance      string
-	authorization *Authorization
-	quarantine    *diskQuarantine
-	queue         chan job
+	status         BackendStatus
+	socket         string
+	conn           string
+	instance       string
+	authorization  *Authorization
+	quarantine     *diskQuarantine
+	queue          chan job
+	dispatchMu     sync.Mutex
+	eventWake      chan struct{}
+	captureEnabled bool
 }
 
 type Manager struct {
-	db               *bolt.DB
-	mu               sync.Mutex
-	backends         map[string]*backend
-	active           map[string]*callState
-	records          map[string]*callState
-	quarantines      map[string]*diskQuarantine
-	ctx              context.Context
-	cancel           context.CancelFunc
-	stop             chan struct{}
-	workers          sync.WaitGroup
-	closeOnce        sync.Once
-	closeErr         error
-	closing          bool
-	dispatches       sync.WaitGroup
-	readinessChanged func()
-	masterUserKeys   []string
+	db                 *bolt.DB
+	mu                 sync.Mutex
+	backends           map[string]*backend
+	active             map[string]*callState
+	records            map[string]*callState
+	quarantines        map[string]*diskQuarantine
+	ctx                context.Context
+	cancel             context.CancelFunc
+	stop               chan struct{}
+	workers            sync.WaitGroup
+	closeOnce          sync.Once
+	closeErr           error
+	closing            bool
+	dispatches         sync.WaitGroup
+	readinessChanged   func()
+	masterUserKeys     []string
+	logEventDispatcher func(context.Context, string, string, string, map[string]interface{}) error
+	logAckWaiters      map[string]chan error
+	captureEnabled     map[string]bool
 }
 
 var (
-	bucketMeta       = []byte("meta")
-	bucketRequests   = []byte("requests")
-	bucketIdentities = []byte("identities")
-	bucketOutbox     = []byte("private_outbox")
-	bucketQuarantine = []byte("quarantine")
+	bucketMeta        = []byte("meta")
+	bucketRequests    = []byte("requests")
+	bucketIdentities  = []byte("identities")
+	bucketOutbox      = []byte("private_outbox")
+	bucketQuarantine  = []byte("quarantine")
+	bucketLogEvents   = []byte("log_events")
+	bucketLogSeen     = []byte("log_seen")
+	bucketLogRejected = []byte("log_rejected")
+	bucketArtifacts   = []byte("artifacts")
 )
 
 func Open(path string) (*Manager, error) {
@@ -209,12 +315,22 @@ func Open(path string) (*Manager, error) {
 	m := &Manager{
 		db: db, backends: map[string]*backend{}, active: map[string]*callState{},
 		records: map[string]*callState{}, quarantines: map[string]*diskQuarantine{}, ctx: ctx, cancel: cancel, stop: make(chan struct{}),
+		logAckWaiters: make(map[string]chan error), captureEnabled: make(map[string]bool),
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketMeta, bucketRequests, bucketIdentities, bucketOutbox, bucketQuarantine} {
+		for _, name := range [][]byte{bucketMeta, bucketRequests, bucketIdentities, bucketOutbox, bucketQuarantine, bucketLogEvents, bucketLogSeen, bucketLogRejected, bucketArtifacts} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
+		}
+		if err := tx.Bucket(bucketMeta).ForEach(func(key, value []byte) error {
+			prefix := "capture-enabled\x00"
+			if strings.HasPrefix(string(key), prefix) && len(value) == 1 && value[0] == 1 {
+				m.captureEnabled[strings.TrimPrefix(string(key), prefix)] = true
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		requests := tx.Bucket(bucketRequests)
 		cursor := requests.Cursor()
@@ -245,6 +361,11 @@ func Open(path string) (*Manager, error) {
 				record.Result.Outputs = []Output{}
 				record.Result.PrivateReceipt = ""
 				record.Result.PrivateCount = 0
+				record.Result.ArtifactReceipts = nil
+				record.ArtifactReceipts = nil
+				if err := deleteArtifactsForCall(tx.Bucket(bucketArtifacts), record.Result.BackendID, record.Result.RequestID); err != nil {
+					return err
+				}
 				unknownJSON, err := json.Marshal(record)
 				if err != nil {
 					return err
@@ -263,6 +384,11 @@ func Open(path string) (*Manager, error) {
 				record.Result.Outputs = []Output{}
 				record.Result.PrivateReceipt = ""
 				record.Result.PrivateCount = 0
+				record.Result.ArtifactReceipts = nil
+				record.ArtifactReceipts = nil
+				if err := deleteArtifactsForCall(tx.Bucket(bucketArtifacts), record.Result.BackendID, record.Result.RequestID); err != nil {
+					return err
+				}
 				encoded, err := json.Marshal(record)
 				if err != nil {
 					return err
@@ -273,6 +399,26 @@ func Open(path string) (*Manager, error) {
 			}
 			if expired {
 				if err := cursor.Delete(); err != nil {
+					return err
+				}
+			}
+		}
+		// An in-flight event belongs to the old websocket connection. Its stable
+		// event ID is retained and it becomes eligible for connection-bound replay.
+		logEvents := tx.Bucket(bucketLogEvents)
+		logCursor := logEvents.Cursor()
+		for key, value := logCursor.First(); key != nil; key, value = logCursor.Next() {
+			var event diskLogEvent
+			if err := json.Unmarshal(value, &event); err != nil {
+				return err
+			}
+			if event.InflightConn != "" || event.InflightSocket != "" || event.RetryAt != 0 {
+				event.InflightConn, event.InflightSocket, event.RetryAt = "", "", 0
+				encoded, err := json.Marshal(event)
+				if err != nil {
+					return err
+				}
+				if err := logEvents.Put(key, encoded); err != nil {
 					return err
 				}
 			}
@@ -290,7 +436,7 @@ func Open(path string) (*Manager, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := m.pruneOutbox(time.Now()); err != nil {
+	if err := m.prune(time.Now()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -300,7 +446,7 @@ func Open(path string) (*Manager, error) {
 			if err := json.Unmarshal(value, &record); err != nil {
 				return err
 			}
-			state := &callState{fingerprint: record.Fingerprint, state: "done", result: record.Result, createdAt: record.CreatedAt, done: make(chan struct{})}
+			state := &callState{fingerprint: record.Fingerprint, state: "done", result: record.Result, createdAt: record.CreatedAt, order: record.Order, done: make(chan struct{})}
 			close(state.done)
 			m.records[string(key)] = state
 			return nil
@@ -345,16 +491,29 @@ func (m *Manager) ConfigureBackends(ids []string) {
 		if id == "" || m.backends[id] != nil {
 			continue
 		}
-		b := &backend{status: BackendStatus{ID: id}, queue: make(chan job, QueueLimit), quarantine: m.quarantines[id]}
+		b := &backend{status: BackendStatus{ID: id}, queue: make(chan job, QueueLimit), quarantine: m.quarantines[id], eventWake: make(chan struct{}, 1), captureEnabled: m.captureEnabled[id]}
 		m.backends[id] = b
 		m.workers.Add(1)
 		go m.worker(id, b)
+		m.workers.Add(1)
+		go m.logWorker(id, b)
 	}
 }
 
 func (m *Manager) SetReadinessCallback(callback func()) {
 	m.mu.Lock()
 	m.readinessChanged = callback
+	m.mu.Unlock()
+}
+
+// SetLogEventDispatcher supplies the bridge-only websocket transport for
+// capture frames. Capture events never enter the MCP tool surface.
+func (m *Manager) SetLogEventDispatcher(dispatcher func(context.Context, string, string, string, map[string]interface{}) error) {
+	m.mu.Lock()
+	m.logEventDispatcher = dispatcher
+	for _, backend := range m.backends {
+		wakeLogWorker(backend)
+	}
 	m.mu.Unlock()
 }
 
@@ -368,8 +527,7 @@ func (m *Manager) SetMasterUserKeys(keys []string) {
 }
 
 // ParseMasterUserKeys reads a JSON string array of appId:originalSDKopenid
-// keys. Invalid input is rejected as a whole so callers can fail closed;
-// duplicate keys are collapsed while preserving their first occurrence.
+// keys. Invalid input is rejected as a whole so callers can fail closed.
 func ParseMasterUserKeys(raw string) ([]string, bool) {
 	if strings.TrimSpace(raw) == "" {
 		return []string{}, true
@@ -404,16 +562,21 @@ func (m *Manager) Register(backendID, socketID string, params RegisterParams) (s
 		return "", ErrInvalidRequest
 	}
 	masterIDs := []int64{}
+	masterKeys := map[string]string{}
 	if hasCapability(params.Capabilities, "master-acl-v1") {
 		m.mu.Lock()
 		keys := append([]string(nil), m.masterUserKeys...)
 		m.mu.Unlock()
 		for _, key := range keys {
+			if !masterUserKeyPattern.MatchString(key) {
+				return "", ErrInvalidRequest
+			}
 			id, err := m.MapIdentity(backendID, "user", key)
-			if err != nil {
-				return "", err
+			if err != nil || id <= 0 || id > 9_007_199_254_740_991 {
+				return "", ErrInvalidRequest
 			}
 			masterIDs = append(masterIDs, id)
+			masterKeys[strconv.FormatInt(id, 10)] = key
 		}
 	}
 	connectionID, err := randomID()
@@ -433,6 +596,9 @@ func (m *Manager) Register(backendID, socketID string, params RegisterParams) (s
 	oldInstance := b.instance
 	if old != "" && b.socket == socketID {
 		return "", ErrInvalidRequest
+	}
+	if err := m.resetConnectionLogsLocked(backendID, ""); err != nil {
+		return "", err
 	}
 	if quarantine := m.quarantines[backendID]; quarantine != nil && quarantine.BackendInstance != params.BackendInstance {
 		if err := m.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bucketQuarantine).Delete([]byte(backendID)) }); err != nil {
@@ -456,7 +622,7 @@ func (m *Manager) Register(backendID, socketID string, params RegisterParams) (s
 	b.authorization = nil
 	b.status.Capabilities = append([]string(nil), params.Capabilities...)
 	if hasCapability(params.Capabilities, "master-acl-v1") {
-		b.authorization = &Authorization{Version: 1, MasterUserIDs: append([]int64{}, masterIDs...)}
+		b.authorization = &Authorization{Version: 1, MasterUserIDs: append([]int64{}, masterIDs...), MasterUserKeys: masterKeys}
 	}
 	b.status.Ready, b.status.Version = false, 1
 	m.notifyReadinessLocked()
@@ -475,7 +641,24 @@ func (m *Manager) Activate(backendID, socketID, connectionID string) error {
 	if b == nil || b.socket != socketID || b.conn != connectionID {
 		return ErrConnectionChanged
 	}
+	captureEnabled := hasCapability(b.status.Capabilities, "log-capture-v1")
+	if err := m.db.Update(func(tx *bolt.Tx) error {
+		key := []byte("capture-enabled\x00" + backendID)
+		if captureEnabled {
+			return tx.Bucket(bucketMeta).Put(key, []byte{1})
+		}
+		return tx.Bucket(bucketMeta).Delete(key)
+	}); err != nil {
+		return ErrCaptureStateUnavailable
+	}
+	b.captureEnabled = captureEnabled
+	if captureEnabled {
+		m.captureEnabled[backendID] = true
+	} else {
+		delete(m.captureEnabled, backendID)
+	}
 	b.status.Ready = b.quarantine == nil
+	wakeLogWorker(b)
 	m.notifyReadinessLocked()
 	return nil
 }
@@ -522,6 +705,7 @@ func (m *Manager) Disconnect(backendID, socketID string) {
 		return
 	}
 	old := b.conn
+	_ = m.resetConnectionLogsLocked(backendID, old)
 	if call := m.active[backendID]; call != nil && call.connectionID == old {
 		_ = m.finishUnknownLocked(call, ErrConnectionChanged)
 	}
@@ -529,6 +713,7 @@ func (m *Manager) Disconnect(backendID, socketID string) {
 	b.status.Ready = false
 	b.status.Capabilities = nil
 	b.authorization = nil
+	wakeLogWorker(b)
 	m.notifyReadinessLocked()
 	m.finishConnectionLocked(backendID, old, ErrConnectionChanged, false)
 }
@@ -542,7 +727,14 @@ func (m *Manager) RegistrationAuthorization(backendID, connectionID string) (Aut
 	if b == nil || connectionID == "" || b.conn != connectionID || b.authorization == nil {
 		return Authorization{}, false
 	}
-	return Authorization{Version: b.authorization.Version, MasterUserIDs: append([]int64{}, b.authorization.MasterUserIDs...)}, true
+	keys := make(map[string]string, len(b.authorization.MasterUserKeys))
+	for id, key := range b.authorization.MasterUserKeys {
+		parsed, err := strconv.ParseInt(id, 10, 64)
+		if err == nil && parsed > 0 && parsed <= 9_007_199_254_740_991 && masterUserKeyPattern.MatchString(key) {
+			keys[id] = key
+		}
+	}
+	return Authorization{Version: b.authorization.Version, MasterUserIDs: append([]int64{}, b.authorization.MasterUserIDs...), MasterUserKeys: keys}, true
 }
 
 func (m *Manager) finishConnectionLocked(backendID, connectionID string, err error, provenNewInstance bool) {
@@ -644,6 +836,10 @@ func (m *Manager) Call(ctx context.Context, request Request, dispatch func(conte
 		m.mu.Unlock()
 		return Result{RequestID: request.RequestID, BackendID: request.BackendID, Audience: request.Audience, Status: "failed", Outputs: []Output{}}, ErrCapabilityUnsupported
 	}
+	if isLogControlRequest(request) && !hasCapability(b.status.Capabilities, "log-capture-v1") {
+		m.mu.Unlock()
+		return Result{RequestID: request.RequestID, BackendID: request.BackendID, Audience: request.Audience, Status: "failed", Outputs: []Output{}}, ErrCapabilityUnsupported
+	}
 	if len(b.queue) >= cap(b.queue) {
 		m.mu.Unlock()
 		return Result{}, ErrQueueFull
@@ -666,6 +862,12 @@ func (m *Manager) Call(ctx context.Context, request Request, dispatch func(conte
 		connectionID: b.conn, socketID: b.socket, backendInstance: b.instance, state: "queued", receipt: receipt,
 		createdAt: createdAt, deadline: created.Add(ExecutionDeadline), done: make(chan struct{}),
 		result: Result{RequestID: request.RequestID, BackendID: request.BackendID, Audience: request.Audience, Status: "unknown", Outputs: []Output{}},
+	}
+	call.order, err = m.reserveDispatchOrder(request.BackendID)
+	if err != nil {
+		cancel()
+		m.mu.Unlock()
+		return Result{}, err
 	}
 	record := m.diskRecord(call, "queued")
 	if err := m.writeRequest(key, record); err != nil {
@@ -729,6 +931,14 @@ func validGroupRole(role string) bool {
 	}
 }
 
+func isLogControlRequest(request Request) bool {
+	if request.Audience != "group" {
+		return false
+	}
+	fields := strings.Fields(request.Payload)
+	return len(fields) > 0 && strings.EqualFold(fields[0], ".log")
+}
+
 func waitCall(ctx context.Context, call *callState) (Result, error) {
 	select {
 	case <-call.done:
@@ -755,6 +965,37 @@ func (m *Manager) execute(backendID string, queued job) {
 	call := queued.call
 	m.mu.Lock()
 	b := m.backends[backendID]
+	m.mu.Unlock()
+	if b == nil {
+		return
+	}
+	b.dispatchMu.Lock()
+	defer b.dispatchMu.Unlock()
+	m.mu.Lock()
+	b = m.backends[backendID]
+	if call.state != "queued" || m.closing {
+		m.mu.Unlock()
+		return
+	}
+	if isLogControlRequest(call.request) && (b == nil || !hasCapability(b.status.Capabilities, "log-capture-v1")) {
+		_ = m.finishStateLocked(call, "failed", ErrCapabilityUnsupported, nil)
+		m.mu.Unlock()
+		return
+	}
+	shouldDrainCapture := b != nil && hasCapability(b.status.Capabilities, "log-capture-v1")
+	m.mu.Unlock()
+	if shouldDrainCapture {
+		if err := m.dispatchLogEventsBefore(queued.ctx, backendID, call.order); err != nil {
+			m.mu.Lock()
+			if call.state != "done" {
+				_ = m.finishUnknownLocked(call, err)
+			}
+			m.mu.Unlock()
+			return
+		}
+	}
+	m.mu.Lock()
+	b = m.backends[backendID]
 	if call.state != "queued" || m.closing {
 		m.mu.Unlock()
 		return
@@ -812,6 +1053,7 @@ func (m *Manager) execute(backendID string, queued job) {
 		_ = m.finishUnknownLocked(call, queued.ctx.Err())
 		m.mu.Unlock()
 	}
+	wakeLogWorker(b)
 }
 
 func (m *Manager) Deliver(backendID, connectionID string, sourceID int32, action, audience string, targetID int64, message string) error {
@@ -830,7 +1072,7 @@ func (m *Manager) Deliver(backendID, connectionID string, sourceID int32, action
 	if audience == "private" && call.request.UserID != targetID {
 		return ErrInvalidRequest
 	}
-	if len(call.outputs)+len(call.private) >= MaxOutputsPerRequest || call.outputBytes+len(message) > MaxOutputTextBytes {
+	if call.acceptedCount >= MaxOutputsPerRequest || call.outputBytes+len(message) > MaxOutputTextBytes {
 		return ErrInvalidRequest
 	}
 	output := PrivateOutput{TargetID: targetID, Message: message}
@@ -912,10 +1154,16 @@ func (m *Manager) finishStateLocked(call *callState, status string, callErr erro
 		if status == "ok" && call.request.Audience == "group" && len(call.private) > 0 {
 			result.PrivateReceipt, result.PrivateCount = call.receipt, len(call.private)
 		}
+		if status == "ok" && len(call.artifacts) > 0 {
+			result.ArtifactReceipts = append([]ArtifactReceipt{}, call.artifacts...)
+		}
 	}
 	key := requestKey(backendID, call.request.RequestID)
 	record := m.diskRecord(call, status)
 	record.Result = result
+	if status != "ok" {
+		record.ArtifactReceipts = nil
+	}
 	err := m.db.Update(func(tx *bolt.Tx) error {
 		encoded, err := json.Marshal(record)
 		if err != nil {
@@ -945,6 +1193,11 @@ func (m *Manager) finishStateLocked(call *callState, status string, callErr erro
 				return err
 			}
 			if err := outbox.Put(privateKey, privateEncoded); err != nil {
+				return err
+			}
+		}
+		if status != "ok" {
+			if err := deleteArtifactsForCall(tx.Bucket(bucketArtifacts), backendID, call.request.RequestID); err != nil {
 				return err
 			}
 		}
@@ -983,6 +1236,9 @@ func (m *Manager) finishStateLocked(call *callState, status string, callErr erro
 			if deleteErr := tx.Bucket(bucketOutbox).Delete(outboxKey(backendID, call.request.RequestID, call.receipt)); deleteErr != nil {
 				return deleteErr
 			}
+			if deleteErr := deleteArtifactsForCall(tx.Bucket(bucketArtifacts), backendID, call.request.RequestID); deleteErr != nil {
+				return deleteErr
+			}
 			if quarantine != nil {
 				qencoded, qerr := json.Marshal(quarantine)
 				if qerr != nil {
@@ -1011,6 +1267,9 @@ func (m *Manager) finishStateLocked(call *callState, status string, callErr erro
 		if b := m.backends[backendID]; b != nil {
 			b.quarantine, b.status.Ready = current, false
 		}
+	}
+	if b := m.backends[backendID]; b != nil {
+		wakeLogWorker(b)
 	}
 	close(call.done)
 	return call.err
@@ -1124,6 +1383,8 @@ func (m *Manager) diskRecord(call *callState, state string) diskRequest {
 		Fingerprint: call.fingerprint, CreatedAt: call.createdAt, State: state, Result: call.result,
 		BackendInstance: call.backendInstance, ConnectionID: call.connectionID, SocketID: call.socketID,
 		SourceID: call.requestID, AcceptedCount: call.acceptedCount, Receipt: call.receipt,
+		GroupKey: call.request.GroupKey, Order: call.order,
+		ArtifactReceipts: append([]ArtifactReceipt(nil), call.artifacts...),
 	}
 }
 
@@ -1193,7 +1454,12 @@ func (m *Manager) writeRequest(key string, record diskRequest) error {
 	if err != nil {
 		return err
 	}
-	return m.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bucketRequests).Put([]byte(key), encoded) })
+	return m.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketRequests).Put([]byte(key), encoded); err != nil {
+			return err
+		}
+		return preventGroupGapMergeTx(tx, record.Result.BackendID, record.GroupKey, record.Order)
+	})
 }
 
 func (m *Manager) deleteRequest(key string) error {
@@ -1216,42 +1482,66 @@ func (m *Manager) cleanupLoop() {
 
 func (m *Manager) prune(now time.Time) error {
 	if err := m.db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketRequests, bucketOutbox} {
-			bucket := tx.Bucket(name)
-			cursor := bucket.Cursor()
-			for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-				var createdAt int64
-				if name == nil {
-					return errors.New("invalid bucket")
+		requests := tx.Bucket(bucketRequests)
+		cursor := requests.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var record diskRequest
+			if err := json.Unmarshal(value, &record); err != nil || now.Sub(time.Unix(0, record.CreatedAt)) > RequestTTL {
+				if err := cursor.Delete(); err != nil {
+					return err
 				}
-				if name[0] == 'r' {
-					var record diskRequest
-					if err := json.Unmarshal(value, &record); err != nil {
-						if err := cursor.Delete(); err != nil {
-							return err
-						}
-						continue
-					}
-					createdAt = record.CreatedAt
-					if now.Sub(time.Unix(0, createdAt)) > RequestTTL {
-						if err := cursor.Delete(); err != nil {
-							return err
-						}
-					}
-				} else {
-					var record diskOutbox
-					if err := json.Unmarshal(value, &record); err != nil {
-						if err := cursor.Delete(); err != nil {
-							return err
-						}
-						continue
-					}
-					createdAt = record.CreatedAt
-					if now.Sub(time.Unix(0, createdAt)) > PrivateOutboxTTL {
-						if err := cursor.Delete(); err != nil {
-							return err
-						}
-					}
+			}
+		}
+		outbox := tx.Bucket(bucketOutbox)
+		cursor = outbox.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var record diskOutbox
+			if err := json.Unmarshal(value, &record); err != nil || now.Sub(time.Unix(0, record.CreatedAt)) > PrivateOutboxTTL {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+			}
+		}
+		seenBucket := tx.Bucket(bucketLogSeen)
+		cursor = seenBucket.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var seen diskLogSeen
+			if err := json.Unmarshal(value, &seen); err != nil {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+				continue
+			}
+			if now.Sub(time.Unix(0, seen.CreatedAt)) > RequestTTL && tx.Bucket(bucketLogEvents).Get(key) == nil {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+			}
+		}
+		rejectedBucket := tx.Bucket(bucketLogRejected)
+		cursor = rejectedBucket.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var rejected diskLogSeen
+			if err := json.Unmarshal(value, &rejected); err != nil {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+				continue
+			}
+			gapPending := rejected.GapEventID != "" && tx.Bucket(bucketLogEvents).Get([]byte(logEventKey(rejected.BackendID, rejected.GapEventID))) != nil
+			if now.Sub(time.Unix(0, rejected.CreatedAt)) > RequestTTL && !gapPending {
+				if err := cursor.Delete(); err != nil {
+					return err
+				}
+			}
+		}
+		artifacts := tx.Bucket(bucketArtifacts)
+		cursor = artifacts.Cursor()
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			var artifact diskArtifact
+			if err := json.Unmarshal(value, &artifact); err != nil || now.Sub(time.Unix(0, artifact.CreatedAt)) > ArtifactTTL {
+				if err := cursor.Delete(); err != nil {
+					return err
 				}
 			}
 		}

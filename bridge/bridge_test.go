@@ -662,7 +662,7 @@ func TestMasterACLIsNegotiatedAndBoundToBackendConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.ConfigureBackends([]string{"backend-a", "backend-b"})
-	m.SetMasterUserKeys([]string{"app:master-openid"})
+	m.SetMasterUserKeys([]string{"123:master-openid"})
 	t.Cleanup(func() { _ = m.Close() })
 
 	legacy, err := m.Register("backend-a", "legacy-socket", RegisterParams{Version: 1, BackendInstance: "legacy", Capabilities: []string{"reply", "complete"}})
@@ -683,6 +683,9 @@ func TestMasterACLIsNegotiatedAndBoundToBackendConnection(t *testing.T) {
 	authA, ok := m.RegistrationAuthorization("backend-a", connA)
 	if !ok || authA.Version != 1 || len(authA.MasterUserIDs) != 1 {
 		t.Fatalf("negotiated ACL missing: %+v %v", authA, ok)
+	}
+	if authA.MasterUserKeys[fmt.Sprint(authA.MasterUserIDs[0])] != "123:master-openid" {
+		t.Fatalf("negotiated display mapping missing: %+v", authA)
 	}
 	if err := m.Activate("backend-a", "acl-socket", connA); err != nil {
 		t.Fatal(err)
@@ -734,7 +737,7 @@ func TestMasterACLIDsFollowStableKeysAfterDatabaseReset(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		m.SetMasterUserKeys([]string{"app:master", "app:other"})
+		m.SetMasterUserKeys([]string{"123:master", "456:other"})
 		conn, err := m.Register("sealdice", "socket", RegisterParams{Version: 1, BackendInstance: "instance", Capabilities: []string{"reply", "complete", "master-acl-v1"}})
 		if err != nil {
 			t.Fatal(err)
@@ -757,7 +760,7 @@ func TestMasterACLIDsFollowStableKeysAfterDatabaseReset(t *testing.T) {
 	if firstAuth.MasterUserIDs[0] == secondAuth.MasterUserIDs[0] {
 		t.Fatal("fixture expected a different allocation after clearing the identity database")
 	}
-	for i, key := range []string{"app:master", "app:other"} {
+	for i, key := range []string{"123:master", "456:other"} {
 		want, err := second.MapIdentity("sealdice", "user", key)
 		if err != nil || secondAuth.MasterUserIDs[i] != want {
 			t.Fatalf("authorization id for stable key %q = %d, MapIdentity = %d, err=%v", key, secondAuth.MasterUserIDs[i], want, err)

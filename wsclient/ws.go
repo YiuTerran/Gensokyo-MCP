@@ -274,7 +274,7 @@ func (client *WebSocketClient) handleIncomingMessages(cancel context.CancelFunc)
 func (client *WebSocketClient) handleIncomingMessagesOn(conn *websocket.Conn, cancel context.CancelFunc) {
 	socketID := client.attachSocket(conn)
 	if getBridgeManager() != nil && conn != nil {
-		conn.SetReadLimit(1024 * 1024)
+		conn.SetReadLimit(16 * 1024 * 1024)
 	}
 	for {
 		if conn == nil {
@@ -508,6 +508,12 @@ func (client *WebSocketClient) recvMessageOn(conn *websocket.Conn, msg []byte) {
 	case "_llm_bridge_complete":
 		client.handleBridgeComplete(conn, manager, wire)
 		return
+	case "_llm_bridge_log_ack":
+		client.handleBridgeLogAck(conn, manager, wire)
+		return
+	case "_llm_bridge_artifact":
+		client.handleBridgeArtifact(conn, manager, wire)
+		return
 	case "send_group_msg", "send_private_msg", "send_msg":
 		client.handleBridgeSend(conn, manager, wire)
 		return
@@ -518,6 +524,56 @@ func (client *WebSocketClient) recvMessageOn(conn *websocket.Conn, msg []byte) {
 		}
 		client.respondToActionOn(conn, wire.Action, echoValue(wire.Echo), params)
 	}
+}
+
+func (client *WebSocketClient) handleBridgeLogAck(conn *websocket.Conn, manager *bridge.Manager, wire actionEnvelope) {
+	var params struct {
+		Version      int    `json:"version"`
+		ConnectionID string `json:"connection_id"`
+		EventID      string `json:"event_id"`
+		Status       string `json:"status"`
+	}
+	if err := decodeStrict(wire.Params, &params); err != nil || params.Version != 1 {
+		_ = client.writeBridgeAck(conn, wire.Echo, false, nil, "log acknowledgement rejected")
+		return
+	}
+	registeredConnection, registered := client.registrationFor(conn)
+	if !registered || registeredConnection != params.ConnectionID {
+		_ = client.writeBridgeAck(conn, wire.Echo, false, nil, "log acknowledgement rejected")
+		return
+	}
+	err := manager.AckLogEvent(client.backendID, params.ConnectionID, params.EventID, params.Status)
+	_ = client.writeBridgeAck(conn, wire.Echo, err == nil, nil, ackMessage(err, "log acknowledgement rejected"))
+}
+
+func (client *WebSocketClient) handleBridgeArtifact(conn *websocket.Conn, manager *bridge.Manager, wire actionEnvelope) {
+	var params struct {
+		Version         int             `json:"version"`
+		ConnectionID    string          `json:"connection_id"`
+		SourceMessageID json.RawMessage `json:"source_message_id"`
+		Filename        string          `json:"filename"`
+		MediaType       string          `json:"media_type"`
+		BytesBase64     string          `json:"bytes_base64"`
+	}
+	if err := decodeStrict(wire.Params, &params); err != nil || params.Version != 1 {
+		_ = client.writeBridgeAck(conn, wire.Echo, false, nil, "artifact rejected")
+		return
+	}
+	registeredConnection, registered := client.registrationFor(conn)
+	if !registered || registeredConnection != params.ConnectionID {
+		_ = client.writeBridgeAck(conn, wire.Echo, false, nil, "artifact rejected")
+		return
+	}
+	sourceID, err := strictMessageID(params.SourceMessageID)
+	var receipt bridge.ArtifactReceipt
+	if err == nil {
+		receipt, err = manager.AcceptArtifact(client.backendID, params.ConnectionID, sourceID, params.Filename, params.MediaType, params.BytesBase64)
+	}
+	data := interface{}(nil)
+	if err == nil {
+		data = receipt
+	}
+	_ = client.writeBridgeAck(conn, wire.Echo, err == nil, data, ackMessage(err, "artifact rejected"))
 }
 
 func (client *WebSocketClient) recvLegacyAction(conn *websocket.Conn, wire actionEnvelope, params callapi.ParamsContent) {

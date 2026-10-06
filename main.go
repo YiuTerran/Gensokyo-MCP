@@ -383,6 +383,17 @@ func main() {
 		defer wsclient.CloseMessageIDAllocator()
 	}
 	wsclient.SetBridgeManager(wsBridge)
+	if wsBridge != nil {
+		wsBridge.SetLogEventDispatcher(func(ctx context.Context, backendID, socketID, connectionID string, frame map[string]interface{}) error {
+			wsClientsMu.RLock()
+			client := wsBackendClients[backendID]
+			wsClientsMu.RUnlock()
+			if client == nil {
+				return errors.New("websocket backend is unavailable")
+			}
+			return client.SendBridgeMessage(ctx, socketID, frame)
+		})
+	}
 	s := NewGensokyoServer()
 
 	// 配置热重载
