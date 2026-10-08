@@ -90,6 +90,213 @@ func TestCaptureReplaysOnlyOnNewConnectionAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestCaptureDisplayIsForwardedOnlyWhenBackendNegotiatesAndDoesNotAffectDedup(t *testing.T) {
+	for _, supportsDisplay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("supports_display_%v", supportsDisplay), func(t *testing.T) {
+			capabilities := []string{"reply", "complete", "log-capture-v1"}
+			if supportsDisplay {
+				capabilities = append(capabilities, CapabilityLogDisplayV1)
+			}
+			m := openCaptureTestManager(t, filepath.Join(t.TempDir(), "bridge.db"), capabilities)
+			frames := make(chan map[string]interface{}, 2)
+			m.SetLogEventDispatcher(func(_ context.Context, _, _, _ string, frame map[string]interface{}) error {
+				frames <- frame
+				return nil
+			})
+			connectionID, ok := currentConnection(t, m, "sealdice")
+			if !ok {
+				t.Fatal("registered connection missing")
+			}
+			event := captureEvent("display-dedup", "mention <@member-openid>")
+			event.Display = &LogDisplay{
+				AuthorAliases: []string{"openid:author-openid"},
+				Mentions:      []LogDisplayMention{{Target: "openid:member-openid", Aliases: []string{"tinyid:4011912066"}, Name: "成员甲"}},
+			}
+			if err := m.Capture(event); err != nil {
+				t.Fatal(err)
+			}
+			frame := receiveFrame(t, frames)
+			if supportsDisplay {
+				if _, ok := frame["display"].(map[string]interface{}); !ok {
+					t.Fatalf("negotiated display metadata missing from frame: %#v", frame)
+				}
+			} else if _, ok := frame["display"]; ok {
+				t.Fatalf("legacy backend received an unknown display field: %#v", frame)
+			}
+			if err := m.AckLogEvent("sealdice", connectionID, event.EventID, "ok"); err != nil {
+				t.Fatal(err)
+			}
+
+			replayed := event
+			replayed.Display = &LogDisplay{AuthorAliases: []string{"openid:author-openid"}, Mentions: []LogDisplayMention{{
+				Target: "openid:member-openid", Name: "改名后的成员",
+			}}}
+			if err := m.Capture(replayed); err != nil {
+				t.Fatalf("display-only change conflicted with v1 dedup fingerprint: %v", err)
+			}
+			if _, exists, err := m.nextLogEvent("sealdice"); err != nil || exists {
+				t.Fatalf("duplicate event was re-enqueued: exists=%v err=%v", exists, err)
+			}
+		})
+	}
+}
+
+func TestCaptureDropsInvalidDisplayButKeepsAuthoritativeMessage(t *testing.T) {
+	m := openCaptureTestManager(t, filepath.Join(t.TempDir(), "bridge.db"), []string{"reply", "complete", "log-capture-v1", CapabilityLogDisplayV1})
+	frames := make(chan map[string]interface{}, 1)
+	m.SetLogEventDispatcher(func(_ context.Context, _, _, _ string, frame map[string]interface{}) error {
+		frames <- frame
+		return nil
+	})
+	connectionID, ok := currentConnection(t, m, "sealdice")
+	if !ok {
+		t.Fatal("registered connection missing")
+	}
+	invalidDisplays := []*LogDisplay{
+		{AuthorAliases: []string{"openid:author-openid"}, Mentions: []LogDisplayMention{{
+			Target: "openid:member-openid", Name: strings.Repeat("鱼", 81),
+		}}},
+		{AuthorAliases: []string{"openid:author-openid"}, Mentions: []LogDisplayMention{{
+			Target: "openid:target",
+			Aliases: []string{"openid:alias-1", "openid:alias-2", "openid:alias-3", "openid:alias-4",
+				"openid:alias-5", "openid:alias-6", "openid:alias-7", "openid:alias-8"},
+		}}},
+	}
+	for index, display := range invalidDisplays {
+		event := captureEvent(fmt.Sprintf("display-over-limit-%d", index), "keep this raw message")
+		event.Display = display
+		if err := m.Capture(event); err != nil {
+			t.Fatalf("invalid optional display should not reject the message: %v", err)
+		}
+		frame := receiveFrame(t, frames)
+		if frame["text"] != event.Text {
+			t.Fatalf("authoritative message was lost: %#v", frame)
+		}
+		if _, ok := frame["display"]; ok {
+			t.Fatalf("invalid display metadata was forwarded: %#v", frame["display"])
+		}
+		if err := m.AckLogEvent("sealdice", connectionID, event.EventID, "ok"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	validWithRepeatedTarget := &LogDisplay{AuthorAliases: []string{"openid:author-openid"}, Mentions: []LogDisplayMention{{
+		Target: "openid:target",
+		Aliases: []string{"openid:target", "openid:alias-1", "openid:alias-2", "openid:alias-3",
+			"openid:alias-4", "openid:alias-5", "openid:alias-6", "openid:alias-7"},
+	}}}
+	if !validLogDisplay(validWithRepeatedTarget) {
+		t.Fatal("a repeated target in aliases should count only once toward the eight-identity limit")
+	}
+}
+
+func TestLogEventV1FingerprintRemainsStableWhenDisplayIsAdded(t *testing.T) {
+	event := captureEvent("fingerprint-v1-golden", "text")
+	if got, want := fingerprintLogEvent(event), "3f88ab630dd4af838664d796ef4b37e75dc28930f7f7119dbf6f29c801961ced"; got != want {
+		t.Fatalf("v1 event fingerprint changed: got=%s want=%s", got, want)
+	}
+	event.Display = &LogDisplay{AuthorAliases: []string{"openid:author-openid"}}
+	if got, want := fingerprintLogEvent(event), "3f88ab630dd4af838664d796ef4b37e75dc28930f7f7119dbf6f29c801961ced"; got != want {
+		t.Fatalf("display metadata changed the v1 dedup fingerprint: got=%s want=%s", got, want)
+	}
+	withoutDisplay := captureEvent("fingerprint-v1-golden", "text")
+	if logEventBytes(event) <= logEventBytes(withoutDisplay) {
+		t.Fatal("capture queue accounting did not include display metadata")
+	}
+}
+
+func TestInternalBackendsAdvertisesBridgeDisplayCapabilityAndCaptureBodyLimit(t *testing.T) {
+	m := openCaptureTestManager(t, filepath.Join(t.TempDir(), "bridge.db"), []string{"reply", "complete", "log-capture-v1"})
+	handler := InternalHandler(m, "internal-token")
+	request := httptest.NewRequest(http.MethodGet, "/internal/backends", nil)
+	request.Header.Set("Authorization", "Bearer internal-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	var body struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || !hasCapability(body.Capabilities, CapabilityLogDisplayV1) {
+		t.Fatalf("bridge display capability missing: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	large := bytes.Repeat([]byte(" "), int(maxCaptureBody)+1)
+	post := httptest.NewRequest(http.MethodPost, "/internal/log/events", bytes.NewReader(large))
+	post.Header.Set("Authorization", "Bearer internal-token")
+	tooLarge := httptest.NewRecorder()
+	handler.ServeHTTP(tooLarge, post)
+	if tooLarge.Code != http.StatusBadRequest {
+		t.Fatalf("capture body above 128 KiB was not rejected: status=%d", tooLarge.Code)
+	}
+}
+
+func TestCaptureHTTPDropsMalformedOptionalDisplayAndRejectsUnknownTopLevel(t *testing.T) {
+	m := openCaptureTestManager(t, filepath.Join(t.TempDir(), "bridge.db"), []string{"reply", "complete", "log-capture-v1", CapabilityLogDisplayV1})
+	connectionID, ok := currentConnection(t, m, "sealdice")
+	if !ok {
+		t.Fatal("registered connection missing")
+	}
+	frames := make(chan map[string]interface{}, 4)
+	m.SetLogEventDispatcher(func(_ context.Context, _, _, _ string, frame map[string]interface{}) error {
+		frames <- frame
+		return nil
+	})
+	handler := InternalHandler(m, "internal-token")
+	post := func(event LogEvent, display any, extraTopLevel bool) *httptest.ResponseRecorder {
+		t.Helper()
+		body := map[string]any{
+			"backend_id": event.BackendID, "event_id": event.EventID, "group_key": event.GroupKey,
+			"user_key": event.UserKey, "time": event.Time, "nickname": event.Nickname,
+			"text": event.Text, "is_bot": event.IsBot, "kind": event.Kind,
+			"display": display,
+		}
+		if extraTopLevel {
+			body["unexpected"] = "reject this"
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/internal/log/events", bytes.NewReader(encoded))
+		req.Header.Set("Authorization", "Bearer internal-token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	for i, display := range []any{
+		map[string]any{"author_aliases": "wrong type", "mentions": []any{}},
+		map[string]any{"author_aliases": []string{"openid:author"}, "mentions": []any{}, "future_field": true},
+	} {
+		event := captureEvent(fmt.Sprintf("malformed-display-%d", i), "preserve authoritative text")
+		response := post(event, display, false)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("malformed optional display rejected its message: status=%d body=%s", response.Code, response.Body.String())
+		}
+		frame := receiveFrame(t, frames)
+		if frame["text"] != event.Text {
+			t.Fatalf("authoritative message changed after dropping malformed display: %#v", frame)
+		}
+		if _, exists := frame["display"]; exists {
+			t.Fatalf("malformed optional display was forwarded: %#v", frame["display"])
+		}
+		if err := m.AckLogEvent("sealdice", connectionID, event.EventID, "ok"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unknown := captureEvent("unknown-top-level", "must be rejected")
+	response := post(unknown, map[string]any{"author_aliases": []string{"openid:author"}, "mentions": []any{}}, true)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("unknown top-level field was not rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("unknown top-level request reached capture worker: %#v", frame)
+	default:
+	}
+}
+
 func TestLateOldWriterFailureDoesNotClearNewCaptureWaiter(t *testing.T) {
 	m := openCaptureTestManager(t, filepath.Join(t.TempDir(), "bridge.db"), []string{"reply", "complete", "log-capture-v1"})
 	oldConn, ok := currentConnection(t, m, "sealdice")
@@ -427,13 +634,31 @@ func TestCaptureHTTPDurableAcceptanceAndQueueFullGap(t *testing.T) {
 		handler.ServeHTTP(recorder, req)
 		return recorder
 	}
-	accepted := post(captureEvent("http-accepted", "hello"))
+	acceptedEvent := captureEvent("http-accepted", "hello")
+	acceptedEvent.Display = &LogDisplay{
+		AuthorAliases: []string{"openid:author-openid"},
+		Mentions:      []LogDisplayMention{{Target: "tinyid:4011912066", Name: "成员甲"}},
+	}
+	accepted := post(acceptedEvent)
 	var acceptedBody map[string]any
 	if err := json.Unmarshal(accepted.Body.Bytes(), &acceptedBody); err != nil {
 		t.Fatal(err)
 	}
 	if accepted.Code != http.StatusAccepted || acceptedBody["accepted"] != true {
 		t.Fatalf("event was not durably accepted: status=%d body=%s", accepted.Code, accepted.Body.String())
+	}
+	var stored diskLogEvent
+	if err := m.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketLogEvents).Get([]byte(logEventKey(acceptedEvent.BackendID, acceptedEvent.EventID)))
+		if raw == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(raw, &stored)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Event.Display == nil || stored.Event.Display.Mentions[0].Name != "成员甲" {
+		t.Fatalf("display metadata was not persisted: %+v", stored.Event.Display)
 	}
 
 	if err := m.db.Update(func(tx *bolt.Tx) error {

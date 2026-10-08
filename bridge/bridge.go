@@ -22,24 +22,25 @@ import (
 )
 
 const (
-	QueueLimit            = 20 // waiting jobs per backend; the worker may own one more job.
-	ExecutionDeadline     = 30 * time.Second
-	MaxOutputsPerRequest  = 64
-	MaxOutputTextBytes    = 128 * 1024
-	RequestTTL            = 24 * time.Hour
-	PrivateOutboxTTL      = 10 * time.Minute
-	CaptureEventLimit     = 10000
-	CaptureSeenLimit      = 50000
-	CaptureRejectedLimit  = 50000
-	CaptureQueueBytes     = 64 * 1024 * 1024
-	CaptureGapLimit       = 512
-	ArtifactTTL           = 10 * time.Minute
-	ArtifactCountLimit    = 20
-	ArtifactBytesLimit    = 64 * 1024 * 1024
-	ArtifactMaxBytes      = 10 * 1024 * 1024
-	CapabilityGroupRoleV1 = "group-role-v1"
-	identityIDStart       = int64(9_000_000_000_000_000)
-	identityIDFloor       = int64(8_000_000_000_000_000)
+	QueueLimit             = 20 // waiting jobs per backend; the worker may own one more job.
+	ExecutionDeadline      = 30 * time.Second
+	MaxOutputsPerRequest   = 64
+	MaxOutputTextBytes     = 128 * 1024
+	RequestTTL             = 24 * time.Hour
+	PrivateOutboxTTL       = 10 * time.Minute
+	CaptureEventLimit      = 10000
+	CaptureSeenLimit       = 50000
+	CaptureRejectedLimit   = 50000
+	CaptureQueueBytes      = 64 * 1024 * 1024
+	CaptureGapLimit        = 512
+	ArtifactTTL            = 10 * time.Minute
+	ArtifactCountLimit     = 20
+	ArtifactBytesLimit     = 64 * 1024 * 1024
+	ArtifactMaxBytes       = 10 * 1024 * 1024
+	CapabilityGroupRoleV1  = "group-role-v1"
+	CapabilityLogDisplayV1 = "log-display-v1"
+	identityIDStart        = int64(9_000_000_000_000_000)
+	identityIDFloor        = int64(8_000_000_000_000_000)
 )
 
 var (
@@ -58,6 +59,7 @@ var (
 	errCaptureRetryWait        = errors.New("capture retry delay has not elapsed")
 	errCaptureAckFailed        = errors.New("capture event was rejected by backend")
 	masterUserKeyPattern       = regexp.MustCompile(`^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$`)
+	logDisplayAliasPattern     = regexp.MustCompile(`^(?:openid:[A-Za-z0-9_-]{1,128}|tinyid:[1-9][0-9]{0,19})$`)
 )
 
 type Request struct {
@@ -110,29 +112,43 @@ type Authorization struct {
 }
 
 type LogEvent struct {
-	BackendID string `json:"backend_id"`
-	EventID   string `json:"event_id"`
-	GroupKey  string `json:"group_key"`
-	UserKey   string `json:"user_key"`
-	Time      int64  `json:"time"`
-	Nickname  string `json:"nickname"`
-	Text      string `json:"text"`
-	IsBot     bool   `json:"is_bot"`
-	Kind      string `json:"kind"`
+	BackendID string      `json:"backend_id"`
+	EventID   string      `json:"event_id"`
+	GroupKey  string      `json:"group_key"`
+	UserKey   string      `json:"user_key"`
+	Time      int64       `json:"time"`
+	Nickname  string      `json:"nickname"`
+	Text      string      `json:"text"`
+	IsBot     bool        `json:"is_bot"`
+	Kind      string      `json:"kind"`
+	Display   *LogDisplay `json:"display,omitempty"`
+}
+
+type LogDisplay struct {
+	AuthorAliases []string            `json:"author_aliases"`
+	Mentions      []LogDisplayMention `json:"mentions"`
+}
+
+type LogDisplayMention struct {
+	Target  string   `json:"target"`
+	Aliases []string `json:"aliases,omitempty"`
+	Name    string   `json:"name,omitempty"`
+	IsBot   bool     `json:"is_bot,omitempty"`
 }
 
 type LogEventFrame struct {
-	PostType     string `json:"post_type"`
-	Version      int    `json:"version"`
-	ConnectionID string `json:"connection_id"`
-	EventID      string `json:"event_id"`
-	GroupID      int64  `json:"group_id"`
-	UserID       int64  `json:"user_id"`
-	Time         int64  `json:"time"`
-	Nickname     string `json:"nickname"`
-	Text         string `json:"text"`
-	IsBot        bool   `json:"is_bot"`
-	Kind         string `json:"kind"`
+	PostType     string      `json:"post_type"`
+	Version      int         `json:"version"`
+	ConnectionID string      `json:"connection_id"`
+	EventID      string      `json:"event_id"`
+	GroupID      int64       `json:"group_id"`
+	UserID       int64       `json:"user_id"`
+	Time         int64       `json:"time"`
+	Nickname     string      `json:"nickname"`
+	Text         string      `json:"text"`
+	IsBot        bool        `json:"is_bot"`
+	Kind         string      `json:"kind"`
+	Display      *LogDisplay `json:"display,omitempty"`
 }
 
 type ArtifactReceipt struct {

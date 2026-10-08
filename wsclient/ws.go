@@ -729,6 +729,12 @@ func (client *WebSocketClient) handleBridgeRegister(conn *websocket.Conn, socket
 		return
 	}
 	data := map[string]interface{}{"version": 1, "connection_id": connectionID}
+	for _, capability := range params.Capabilities {
+		if capability == bridge.CapabilityLogDisplayV1 {
+			data["capabilities"] = []string{bridge.CapabilityLogDisplayV1}
+			break
+		}
+	}
 	if authorization, ok := manager.RegistrationAuthorization(client.backendID, connectionID); ok {
 		data["authorization"] = authorization
 	}

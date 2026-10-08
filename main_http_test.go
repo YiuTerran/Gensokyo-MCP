@@ -321,15 +321,17 @@ func (b *fakeOneBotBackend) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	go b.readLoop(conn)
 	ack, err := b.sendAction("_llm_bridge_register", map[string]any{
-		"version": 1, "backend_instance": "go-http-fixture", "capabilities": []string{"reply", "complete", bridge.CapabilityGroupRoleV1},
+		"version": 1, "backend_instance": "go-http-fixture", "capabilities": []string{"reply", "complete", bridge.CapabilityGroupRoleV1, bridge.CapabilityLogDisplayV1},
 	}, json.RawMessage(`{"register":["arbitrary",true,null,7]}`))
 	if err != nil || ack.Status != "ok" {
 		return
 	}
 	var registration struct {
-		ConnectionID string `json:"connection_id"`
+		ConnectionID string   `json:"connection_id"`
+		Capabilities []string `json:"capabilities"`
 	}
-	if json.Unmarshal(ack.Data, &registration) != nil || registration.ConnectionID == "" {
+	if json.Unmarshal(ack.Data, &registration) != nil || registration.ConnectionID == "" ||
+		!bridgeCapabilityPresent(registration.Capabilities, bridge.CapabilityLogDisplayV1) {
 		return
 	}
 	b.connectionID.Store(registration.ConnectionID)

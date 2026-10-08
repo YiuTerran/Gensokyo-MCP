@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,43 @@ import (
 )
 
 const maxInternalBody = 16 * 1024
-const maxCaptureBody = 512 * 1024
+const maxCaptureBody = 128 * 1024
+
+type captureLogEventRequest struct {
+	BackendID string          `json:"backend_id"`
+	EventID   string          `json:"event_id"`
+	GroupKey  string          `json:"group_key"`
+	UserKey   string          `json:"user_key"`
+	Time      int64           `json:"time"`
+	Nickname  string          `json:"nickname"`
+	Text      string          `json:"text"`
+	IsBot     bool            `json:"is_bot"`
+	Kind      string          `json:"kind"`
+	Display   json.RawMessage `json:"display,omitempty"`
+}
+
+func (r captureLogEventRequest) logEvent() LogEvent {
+	event := LogEvent{
+		BackendID: r.BackendID,
+		EventID:   r.EventID,
+		GroupKey:  r.GroupKey,
+		UserKey:   r.UserKey,
+		Time:      r.Time,
+		Nickname:  r.Nickname,
+		Text:      r.Text,
+		IsBot:     r.IsBot,
+		Kind:      r.Kind,
+	}
+	if len(r.Display) > 0 {
+		var display LogDisplay
+		decoder := json.NewDecoder(bytes.NewReader(r.Display))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&display) == nil && validLogDisplay(&display) {
+			event.Display = &display
+		}
+	}
+	return event
+}
 
 func HealthHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +75,10 @@ func InternalHandler(manager *Manager, token string) http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"backends": manager.Backends()})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"backends":     manager.Backends(),
+			"capabilities": []string{CapabilityLogDisplayV1},
+		})
 	}))
 	mux.Handle("/internal/private/claim", protect(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -85,12 +125,12 @@ func InternalHandler(manager *Manager, token string) http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var body LogEvent
+		var body captureLogEventRequest
 		if err := decodeBoundedJSONLimit(w, r, &body, maxCaptureBody); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 			return
 		}
-		if err := manager.Capture(body); err != nil {
+		if err := manager.Capture(body.logEvent()); err != nil {
 			writeManagerError(w, err)
 			return
 		}

@@ -44,6 +44,11 @@ func (m *Manager) Capture(event LogEvent) error {
 	if !validLogEvent(event) {
 		return ErrInvalidRequest
 	}
+	if event.Display != nil && !validLogDisplay(event.Display) {
+		// Display names are optional convenience data. Invalid or over-budget
+		// metadata must not make the authoritative message disappear.
+		event.Display = nil
+	}
 	kind := "user"
 	if event.IsBot {
 		kind = "bot"
@@ -59,6 +64,7 @@ func (m *Manager) Capture(event LogEvent) error {
 	if event.Kind == "gap" {
 		event.Nickname = ""
 		event.Text = fixedGapText(1, event.Time, event.Time)
+		event.Display = nil
 	}
 	fingerprint := fingerprintLogEvent(event)
 	key := logEventKey(event.BackendID, event.EventID)
@@ -286,15 +292,77 @@ func validLogEvent(event LogEvent) bool {
 	return true
 }
 
+func validLogDisplay(display *LogDisplay) bool {
+	if display == nil || len(display.AuthorAliases) < 1 || len(display.AuthorAliases) > 8 || len(display.Mentions) > 64 {
+		return false
+	}
+	validAliases := func(aliases []string, allowEmpty bool) bool {
+		if len(aliases) > 8 || (!allowEmpty && len(aliases) == 0) {
+			return false
+		}
+		for _, alias := range aliases {
+			if len(alias) > 160 || !logDisplayAliasPattern.MatchString(alias) {
+				return false
+			}
+		}
+		return true
+	}
+	if !validAliases(display.AuthorAliases, false) {
+		return false
+	}
+	for _, mention := range display.Mentions {
+		if len(mention.Target) > 160 || !logDisplayAliasPattern.MatchString(mention.Target) || !validAliases(mention.Aliases, true) {
+			return false
+		}
+		identityAliases := map[string]struct{}{mention.Target: {}}
+		for _, alias := range mention.Aliases {
+			identityAliases[alias] = struct{}{}
+		}
+		if len(identityAliases) > 8 {
+			return false
+		}
+		if mention.Name != "" {
+			if !utf8.ValidString(mention.Name) || len(mention.Name) > 256 || utf8.RuneCountInString(mention.Name) > 80 {
+				return false
+			}
+			for _, r := range mention.Name {
+				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+					return false
+				}
+			}
+		}
+	}
+	encoded, err := json.Marshal(display)
+	return err == nil && len(encoded) <= 16*1024
+}
+
 func logEventKey(backendID, eventID string) string { return backendID + "\x00" + eventID }
 func logEventBytes(event LogEvent) int {
-	return len(event.BackendID) + len(event.EventID) + len(event.GroupKey) + len(event.UserKey) + len(event.Nickname) + len(event.Text) + 128
+	bytes := len(event.BackendID) + len(event.EventID) + len(event.GroupKey) + len(event.UserKey) + len(event.Nickname) + len(event.Text) + 128
+	if event.Display != nil {
+		if encoded, err := json.Marshal(event.Display); err == nil {
+			bytes += len(encoded)
+		}
+	}
+	return bytes
 }
 func fixedGapText(count int, first, last int64) string {
 	return fmt.Sprintf("[log gap: %d event(s) could not be queued; event times %d through %d]", count, first, last)
 }
 func fingerprintLogEvent(event LogEvent) string {
-	data, _ := json.Marshal(event)
+	// Keep the v1 deduplication contract stable: presentation metadata may
+	// change on a replay, but it must not create a conflicting source event.
+	data, _ := json.Marshal(struct {
+		BackendID string `json:"backend_id"`
+		EventID   string `json:"event_id"`
+		GroupKey  string `json:"group_key"`
+		UserKey   string `json:"user_key"`
+		Time      int64  `json:"time"`
+		Nickname  string `json:"nickname"`
+		Text      string `json:"text"`
+		IsBot     bool   `json:"is_bot"`
+		Kind      string `json:"kind"`
+	}{event.BackendID, event.EventID, event.GroupKey, event.UserKey, event.Time, event.Nickname, event.Text, event.IsBot, event.Kind})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -444,6 +512,9 @@ func (m *Manager) sendLogEvent(ctx context.Context, backendID string, event disk
 	waiter := make(chan error, 1)
 	m.logAckWaiters[key] = waiter
 	frame := LogEventFrame{PostType: "_llm_bridge_log_event", Version: 1, ConnectionID: connectionID, EventID: current.Event.EventID, GroupID: current.GroupID, UserID: current.UserID, Time: current.Event.Time, Nickname: current.Event.Nickname, Text: current.Event.Text, IsBot: current.Event.IsBot, Kind: current.Event.Kind}
+	if hasCapability(b.status.Capabilities, CapabilityLogDisplayV1) {
+		frame.Display = current.Event.Display
+	}
 	message := map[string]interface{}{}
 	encodedFrame, _ := json.Marshal(frame)
 	_ = json.Unmarshal(encodedFrame, &message)
